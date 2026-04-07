@@ -1,36 +1,51 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Quantneon Frontend — 3D Metaverse Portal
+
+A futuristic Next.js (App Router) + React Three Fiber landing page for **Quantneon**, the Gamified Social AR/VR Hub of the Quant Ecosystem.
+
+## Features
+
+| Feature | Implementation |
+|---|---|
+| 3D Metaverse Portal | React Three Fiber full-screen WebGL scene |
+| Neon City Scene | Procedural city spires, floating orbs, neon grid floor |
+| Avatar Hologram | Glowing wireframe + solid icosahedron "Digital Twin" |
+| Immersive Controls | OrbitControls (drag to orbit, scroll to zoom, right-drag to pan) |
+| Enter Chill Room Portal | Interactive 3D MeshTransmissionMaterial portal with hover effects |
+| Post-Processing | Bloom + ChromaticAberration via @react-three/postprocessing |
+| 2D HUD Overlay | Tailwind CSS overlay with live clock, controls hint, ecosystem links |
+| Cyberpunk Aesthetic | Deep-space bg, neon cyan #00f5ff, magenta #ff00ff, purple #8b00ff |
+
+## Tech Stack
+
+- **Next.js 16** (App Router, "use client" for R3F)
+- **React Three Fiber** (@react-three/fiber)
+- **Drei helpers** (@react-three/drei) — OrbitControls, Float, Text, Grid, MeshTransmissionMaterial
+- **Post-processing** (@react-three/postprocessing) — Bloom, ChromaticAberration
+- **Three.js** + TypeScript
+- **Tailwind CSS v4**
 
 ## Getting Started
 
-First, run the development server:
-
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cd quantneon-frontend
+npm install
+npm run dev        # http://localhost:3000
+npm run build      # production build
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Scene Controls
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+| Input | Action |
+|---|---|
+| Left-drag | Orbit camera |
+| Scroll wheel | Zoom in / out |
+| Right-drag | Pan camera |
+| Click portal | Toggle "Enter Chill Room" overlay |
+| 2D button | "ENTER CHILL ROOM" (bottom-center) |
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Quant Ecosystem Integration
 
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+The portal simulates connections to:
+- **Quantchat** — real-time chat in the Chill Room
+- **Quantchill** — ambient audio / relaxation hub
+- **Quantmail** — master identity for the Digital Twin hologram
