@@ -21,9 +21,10 @@ signal capacity_reached()
 @export var ambient_color: Color = Color(0.05, 0.0, 0.15) # Deep neon purple
 
 # ─── State ────────────────────────────────────────────────────────────────────
-/** Interpolation speed for avatar movement smoothing (0–1, higher = snappier). */
+## Interpolation speed for avatar movement smoothing (0–1, higher = snappier).
 @export var position_lerp_speed: float = 0.2
 @export var rotation_lerp_speed: float = 0.2
+var active_stream_id: String = ""
 var present_users: Dictionary = {} # { user_id: { display_name, avatar_node } }
 var _avatar_scene: PackedScene = null
 

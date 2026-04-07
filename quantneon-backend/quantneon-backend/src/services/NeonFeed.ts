@@ -48,6 +48,8 @@ export interface FeedResult {
   personalized: boolean;
 }
 
+type NeonFeedSourcePost = Omit<FeedPost, 'score'>;
+
 /** Multiplier applied to `limit` when fetching posts for AI reranking headroom. */
 const RANKING_HEADROOM_MULTIPLIER = 3;
 
@@ -110,7 +112,7 @@ export const NeonFeedService = {
       // Redis unavailable — proceed without cache
     }
 
-    const [rawPosts, total] = await Promise.all([
+    const [rawPosts, total]: [NeonFeedSourcePost[], number] = await Promise.all([
       prisma.neonPost.findMany({
         take: limit * RANKING_HEADROOM_MULTIPLIER, // Fetch 3× for AI reranking headroom
         skip: offset,
@@ -122,7 +124,7 @@ export const NeonFeedService = {
       prisma.neonPost.count(),
     ]);
 
-    const posts = rawPosts.map((post: Omit<FeedPost, 'score'>) => ({ ...post, score: 0 }));
+    const posts = rawPosts.map((post): FeedPost => ({ ...post, score: 0 }));
     const context = await _getUserContext(userId);
     const ranked = await _rankWithAI(posts, context);
     const page = ranked.slice(0, limit);
