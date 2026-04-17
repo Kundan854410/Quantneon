@@ -670,9 +670,9 @@ func _dict_to_color(d: Dictionary) -> Color:
 func randomise_paint() -> void:
 	var h := randf()
 	var s := randf_range(0.6, 1.0)
-	var v := randf_range(0.5, 1.0)
+	var brightness := randf_range(0.5, 1.0)
 	var finish := ALL_FINISHES[randi() % ALL_FINISHES.size()]
-	set_paint_from_hsv(h, s, v, finish)
+	set_paint_from_hsv(h, s, brightness, finish)
 
 func randomise_decal() -> void:
 	var id := randi() % DECAL_TEMPLATES.size()

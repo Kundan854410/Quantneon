@@ -587,8 +587,7 @@ func _get_filtered_listings() -> Array:
 			"my_bids":
 				if listing.get("current_bidder_id", "") != _current_player_id:
 					continue
-
-	result = _listings.filter(func(l): return l["state"] == STATE_ACTIVE)
+		result.append(listing)
 
 	match _sort_mode:
 		"newest":
@@ -603,17 +602,6 @@ func _get_filtered_listings() -> Array:
 			result.sort_custom(func(a, b): return a["views"] > b["views"])
 		"likes":
 			result.sort_custom(func(a, b): return a["likes"] > b["likes"])
-
-	if _search_query != "":
-		var q := _search_query.to_lower()
-		result = result.filter(func(l):
-			if l["vehicle_name"].to_lower().contains(q): return true
-			if l["seller_name"].to_lower().contains(q): return true
-			if l["description"].to_lower().contains(q): return true
-			for tag in l.get("tags", []):
-				if tag.to_lower().contains(q): return true
-			return false
-		)
 
 	return result
 

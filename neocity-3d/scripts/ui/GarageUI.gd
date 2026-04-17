@@ -910,8 +910,7 @@ func _on_comparison_slider_changed(value: float) -> void:
 	if value < 0.5:
 		customizer.restore_before()
 	else:
-		var after_conf := customizer.current_config.duplicate(true)
-		customizer.apply_config(after_conf)
+		customizer.apply_config(customizer.current_config)
 
 func _on_show_before() -> void:
 	if customizer:
