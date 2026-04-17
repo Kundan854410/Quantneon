@@ -1,5 +1,19 @@
 ## Central World Sync Manager
 ## Orchestrates Socket.IO events and updates the 3D scene.
+##
+## Spatial-Partitioning layer (10K player support)
+## ─────────────────────────────────────────────────
+## All remote entities are bucketed into a spatial hash-grid with cell size
+## SPATIAL_CELL_SIZE (world units).  Each frame the grid is consulted to find
+## which entities share cells with the local player; only those entities receive
+## full position/state updates and are kept visible.  Entities that fall outside
+## VISUAL_RANGE are hidden (not freed) so they can be cheaply re-shown when the
+## local player approaches.
+##
+## The server snapshot still arrives with ALL players in the zone, but the
+## client-side culling pass filters the set before any Tween / Node work is done,
+## keeping the per-frame cost proportional to visible density rather than total
+## concurrent count.
 
 extends Node
 
@@ -18,11 +32,30 @@ extends Node
 
 @export var announcement_scene: PackedScene = preload("res://scenes/announcement_banner.tscn")
 
+# ── Spatial partitioning config ───────────────────────────────────────────────
+## World-unit size of each spatial grid cell.
+@export var spatial_cell_size: float = 50.0
+
+## Distance (world units) within which remote entities receive full updates.
+## Entities beyond this radius are hidden until the player moves closer.
+@export var visual_range: float = 120.0
+
+## Number of physics frames between full spatial-partition sweeps.
+## At 60 fps and interval=6 this runs at 10 Hz — same rate as the move sync.
+@export var spatial_sweep_interval: int = 6
+
 # ── Tracking ─────────────────────────────────────────
 var entities: Dictionary = {} # {id: Node3D}
 var quantad_anchors: Dictionary = {} # {ad_id: Node3D}
 var quantad_fallback_counter: int = 0
 var local_player: CharacterBody3D
+
+# Spatial hash grid: maps cell_key (Vector2i) → Array[String] of entity IDs.
+# Rebuilt on every zone_update snapshot so it always reflects the server state.
+var _spatial_grid: Dictionary = {}
+
+# Last known server-reported world position (in scaled coords x/10, z/10) per entity id.
+var _entity_server_pos: Dictionary = {} # {id: Vector3}
 
 signal world_entered(data)
 signal zone_update_received(snapshot)
@@ -167,6 +200,10 @@ func _handle_zone_update(snapshot: Dictionary):
 		for elev_data in snapshot.elevators:
 			_update_or_create_entity(elev_data, elevator_scene, "elevator")
 
+	# 9. Rebuild spatial grid after snapshot is fully processed so the
+	#    visibility sweep on the next physics frame uses fresh positions.
+	_rebuild_spatial_grid()
+
 func _update_or_create_entity(data: Dictionary, scene: PackedScene, type: String):
 	var id = data.id if data.has("id") else data.userId
 	
@@ -192,6 +229,19 @@ func _update_or_create_entity(data: Dictionary, scene: PackedScene, type: String
 			return
 
 	var target_pos = Vector3(data.x / 10.0, 1.0, data.y / 10.0)
+
+	# Keep the spatial index up-to-date for this entity regardless of distance.
+	# The position must always be fresh so the visibility sweep can correctly
+	# show the node the moment the player walks within visual_range.
+	_entity_server_pos[id] = target_pos
+
+	# Skip the expensive Tween/state work for entities outside visual range.
+	# Their node is already hidden by _run_spatial_visibility_sweep; the
+	# recorded position above ensures they re-appear correctly when approached.
+	if local_player != null:
+		var dist_sq: float = local_player.global_position.distance_squared_to(target_pos)
+		if dist_sq > visual_range * visual_range:
+			return
 	
 	if entity.has_method("set_remote_mode"):
 		entity.is_remote = true
@@ -219,6 +269,7 @@ func _update_or_create_entity(data: Dictionary, scene: PackedScene, type: String
 		if entity.has_method("die") and not entity.is_dead:
 			entity.die()
 			entities.erase(id)
+			_entity_server_pos.erase(id)
 
 func _handle_quest_update(data: Dictionary):
 	if has_node("/root/MissionHUD"):
@@ -279,14 +330,85 @@ func _handle_zone_notification(data: Dictionary):
 	print("[Zone Notification] ", data.message)
 
 func _physics_process(_delta):
+	var frame: int = Engine.get_physics_frames()
+
 	# Sync local player movement to server at ~10Hz
-	if Engine.get_physics_frames() % 6 == 0: # 60fps / 6 = 10Hz
+	if frame % 6 == 0:
 		if local_player and socket_client.is_connected:
 			var intent = {
 				"x": local_player.velocity.x,
 				"y": local_player.velocity.z
 			}
 			socket_client.send_event("player_move", {"intent": intent})
+
+	# Spatial-partition visibility sweep at the same 10 Hz cadence.
+	if frame % spatial_sweep_interval == 0:
+		_run_spatial_visibility_sweep()
+
+
+# ── Spatial Partitioning Helpers ──────────────────────────────────────────────
+
+## Returns the grid cell key for a world-space XZ position.
+func _cell_key(world_pos: Vector3) -> Vector2i:
+	return Vector2i(
+		int(floor(world_pos.x / spatial_cell_size)),
+		int(floor(world_pos.z / spatial_cell_size))
+	)
+
+## Rebuilds the spatial hash grid from the current _entity_server_pos map.
+func _rebuild_spatial_grid() -> void:
+	_spatial_grid.clear()
+	for id in _entity_server_pos:
+		var pos: Vector3 = _entity_server_pos[id]
+		var key: Vector2i = _cell_key(pos)
+		if not _spatial_grid.has(key):
+			_spatial_grid[key] = []
+		_spatial_grid[key].append(id)
+
+## Returns the set of entity IDs that are within visual_range of the local player.
+## Uses the spatial grid to avoid an O(N) linear scan across all entities.
+func _get_ids_in_visual_range() -> Dictionary:
+	var visible_ids: Dictionary = {}
+	if local_player == null:
+		return visible_ids
+
+	var player_pos: Vector3 = local_player.global_position
+	var player_cell: Vector2i = _cell_key(player_pos)
+
+	# Calculate how many cells we need to check in each direction.
+	var cell_radius: int = int(ceil(visual_range / spatial_cell_size)) + 1
+
+	for dx in range(-cell_radius, cell_radius + 1):
+		for dz in range(-cell_radius, cell_radius + 1):
+			var check_key: Vector2i = player_cell + Vector2i(dx, dz)
+			if not _spatial_grid.has(check_key):
+				continue
+			for id in _spatial_grid[check_key]:
+				if visible_ids.has(id):
+					continue
+				# Fine-grained distance check inside the candidate cell.
+				var ep: Vector3 = _entity_server_pos.get(id, Vector3.ZERO)
+				if player_pos.distance_squared_to(ep) <= visual_range * visual_range:
+					visible_ids[id] = true
+	return visible_ids
+
+## Shows/hides entity nodes based on proximity to the local player.
+## This is the key performance win for 10 K concurrent connections: nodes
+## outside visual_range are hidden (not freed) so no transform/tween work
+## is wasted on them each frame.
+func _run_spatial_visibility_sweep() -> void:
+	if local_player == null or _spatial_grid.is_empty():
+		return
+
+	var visible_ids: Dictionary = _get_ids_in_visual_range()
+
+	for id in entities:
+		var node: Node3D = entities[id]
+		if not is_instance_valid(node):
+			continue
+		var should_show: bool = visible_ids.has(id)
+		if node.visible != should_show:
+			node.visible = should_show
 
 func _handle_zipline_ride(data: Dictionary):
 	var user_id = data.get("userId", "")
