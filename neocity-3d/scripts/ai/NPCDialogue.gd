@@ -1,692 +1,660 @@
-## NPCDialogue.gd
-## Template-based dialogue generation system for NPCs in Neo City.
-## Handles personality-driven responses, player memory recall, gossip sharing,
-## and mini-quest generation based on world state.
+## NPCDialogue — Template-based dialogue generator for NPCs.
+##
+## Lines are produced by mixing:
+##   • Personality trait thresholds (friendliness, humor, aggression, …).
+##   • Current mood (positive / neutral / negative).
+##   • Player relationship — first meeting vs returning, trust level.
+##   • Recent memory (the latest entry about the player), so the NPC can
+##     say things like "Hey, you mentioned you were building on Block 5
+##     last time!".
+##   • Keyword routing — the player text is scanned for topic keywords
+##     (trade, quest, gossip, faction, …) which select a template bucket.
+##   • Gossip swap between NPCs: share_gossip_with_npc / receive_gossip.
+##   • Per-occupation quest generation with rewards and time limits.
+##
+## Templates use `{placeholder}` tokens; the generator fills them from a
+## context Dictionary.  All outputs are deterministic given the NPCBrain's
+## RNG state.
 
-extends Node
+class_name NPCDialogue
+extends RefCounted
 
-# ── Signals ─────────────────────────────────────────────────────────────────
+const NPCBrain = preload("res://scripts/ai/NPCBrain.gd")
 
-signal dialogue_line_ready(line: String)
-signal quest_offered(quest: Dictionary)
-signal gossip_shared(data: Dictionary)
-signal dialogue_ended()
+const TOPIC_GENERIC: String = "generic"
+const TOPIC_TRADE: String = "trade"
+const TOPIC_QUEST: String = "quest"
+const TOPIC_GOSSIP: String = "gossip"
+const TOPIC_FACTION: String = "faction"
+const TOPIC_WEATHER: String = "weather"
+const TOPIC_BUILDING: String = "building"
+const TOPIC_GREETING: String = "greeting"
+const TOPIC_FAREWELL: String = "farewell"
+const TOPIC_THREAT: String = "threat"
+const TOPIC_SELF: String = "self"
 
-# ── References ───────────────────────────────────────────────────────────────
+const QUEST_MAX_ACTIVE_PER_NPC: int = 3
+const QUEST_DEFAULT_TTL_SECS: float = 1800.0
+const GOSSIP_DEDUPE_WINDOW_SECS: float = 300.0
 
-var brain: Node = null          # NPCBrain reference
-var economy: Node = null        # NPCEconomy reference (optional)
+var _brain  # NPCBrain reference (typed dynamic to avoid circular class_name)
+var _rng: RandomNumberGenerator
+var _active_quests: Dictionary = {}  # quest_id -> quest dict
+var _completed_quest_ids: Array = []
+var _recent_gossip_log: Array = []  # [{from_npc, player_id, at_unix}]
 
-# ── State ─────────────────────────────────────────────────────────────────────
 
-var is_in_dialogue: bool = false
-var current_player_id: String = ""
-var current_player_node: Node = null
-var dialogue_history: Array = []   # lines exchanged this session
-var session_turn: int = 0
+# Template catalog — each bucket is a PackedStringArray keyed by
+# (topic, mood_bucket, relationship).  mood_bucket: "bad"|"mid"|"good".
+# relationship: "stranger"|"known"|"friend"|"enemy".
+# When a specific bucket is missing we fall through to less-specific
+# ones in the order: (topic, mood, relationship) → (topic, mood, *) →
+# (topic, *, *) → (GENERIC, *, *).
+var _templates: Dictionary = {}
 
-# ── Quest Tracking ────────────────────────────────────────────────────────────
 
-var active_quests: Array = []          # quests currently offered
-var completed_quests: Array = []       # quest ids finished
+func _init(brain) -> void:
+	_brain = brain
+	_rng = RandomNumberGenerator.new()
+	_rng.randomize()
+	_build_templates()
 
-const MAX_ACTIVE_QUESTS: int = 3
 
-# ── Gossip Cache ──────────────────────────────────────────────────────────────
+# ── Template authoring ────────────────────────────────────────────────
 
-## gossip_pool: Array of { player_id, topic, source_npc }
-var gossip_pool: Array = []
-const MAX_GOSSIP_POOL: int = 30
+func _build_templates() -> void:
+	_templates = {
+		TOPIC_GREETING: {
+			"good": {
+				"stranger": [
+					"Ha! A new face. Welcome to {district}, stranger.",
+					"Oh hey! Never seen you around — what's your name?",
+					"Neon be with you, traveler. You lost?",
+				],
+				"known": [
+					"Back again, {player}! How's life been?",
+					"{player}! Good to see you.",
+				],
+				"friend": [
+					"My friend {player}! You always know when to show up.",
+					"Hah, {player} — the one person I was hoping to run into.",
+				],
+				"enemy": [
+					"…you. I'll still hear you out. Don't push it.",
+					"{player}. Didn't expect to see you smiling at me.",
+				],
+			},
+			"mid": {
+				"stranger": [
+					"Hi. What do you need?",
+					"Yeah? You talking to me?",
+				],
+				"known": [
+					"{player}. Back on the grid, huh?",
+					"Oh, it's you again.",
+				],
+				"friend": [
+					"Hey {player}. Keeping out of trouble?",
+				],
+				"enemy": [
+					"Make it quick, {player}.",
+				],
+			},
+			"bad": {
+				"stranger": [
+					"What do you want.",
+					"Not in the mood, chummer.",
+				],
+				"known": [
+					"{player}. Today's not the day.",
+				],
+				"friend": [
+					"Ugh — {player}, I'm having a rough one.",
+				],
+				"enemy": [
+					"Walk away, {player}.",
+				],
+			},
+		},
+		TOPIC_FAREWELL: {
+			"good": {
+				"stranger": [
+					"Stay neon, stranger.",
+					"Catch you in the wires.",
+				],
+				"known": [
+					"Later, {player}!",
+					"Don't be a stranger, {player}.",
+				],
+				"friend": [
+					"Take care of yourself, {player}. You know where to find me.",
+				],
+				"enemy": [
+					"Leave. Quietly.",
+				],
+			},
+			"mid": {
+				"stranger": ["Bye.", "See you."],
+				"known": ["Later, {player}."],
+			},
+			"bad": {
+				"stranger": ["Get out of my face.", "Go."],
+				"known": ["Not now, {player}."],
+				"enemy": ["If I see you again, {player}, don't smile."],
+			},
+		},
+		TOPIC_TRADE: {
+			"good": {
+				"stranger": [
+					"Take a look at the stall. Prices are fair today.",
+					"I've got goods — cheaper than the corp stores, I promise.",
+				],
+				"known": [
+					"{player}, for you — 10% off on {stock_sample}.",
+				],
+				"friend": [
+					"Regular discount applies, {player}. What are you after?",
+				],
+			},
+			"mid": {
+				"stranger": ["Prices are on the board. Ask if you need detail."],
+				"known": ["Usual rates, {player}."],
+			},
+			"bad": {
+				"stranger": ["Buying or leaving?"],
+			},
+		},
+		TOPIC_QUEST: {
+			"good": {
+				"stranger": [
+					"If you've got time, I could use a hand with something.",
+					"Actually… you look capable. Interested in a job?",
+				],
+				"known": [
+					"{player}, I've got a new gig if you want it.",
+				],
+				"friend": [
+					"{player} — got something special this time. Pays well.",
+				],
+			},
+			"mid": {
+				"stranger": ["There's work if you want it. Small pay."],
+			},
+			"bad": {
+				"stranger": ["I've got nothing for you."],
+			},
+		},
+		TOPIC_GOSSIP: {
+			"good": {
+				"stranger": [
+					"Oh, you want the word on the street? Sit down.",
+					"Rumor mill is spinning — want to hear?",
+				],
+				"known": [
+					"I heard something about {gossip_player} the other night…",
+				],
+				"friend": [
+					"{player}, between us — {gossip_detail}.",
+				],
+			},
+			"mid": {
+				"stranger": ["Heard some chatter. Nothing solid."],
+			},
+			"bad": {
+				"stranger": ["Keep your rumors to yourself."],
+			},
+		},
+		TOPIC_FACTION: {
+			"good": {
+				"stranger": [
+					"Factions? {faction} is the one worth talking to around here.",
+				],
+				"known": [
+					"{player}, careful who you run with. {faction} watches this block.",
+				],
+			},
+			"mid": {
+				"stranger": ["Stay out of faction business if you know what's good."],
+			},
+			"bad": {
+				"enemy": ["Your colors are not welcome here, {player}."],
+			},
+		},
+		TOPIC_WEATHER: {
+			"good": {
+				"stranger": [
+					"Weather's turning {weather}. Nice change, eh?",
+				],
+			},
+			"mid": {
+				"stranger": ["Ugh, this {weather} again."],
+			},
+			"bad": {
+				"stranger": ["This {weather} is killing the mood."],
+			},
+		},
+		TOPIC_BUILDING: {
+			"good": {
+				"known": [
+					"Still building on {memory_detail}? I like what you're doing.",
+					"Hey — last time you mentioned {memory_detail}. How's that going?",
+				],
+				"friend": [
+					"{player}, your place on {memory_detail} is the talk of the district.",
+				],
+			},
+			"mid": {
+				"known": ["You were on {memory_detail}, right? Fix that roof yet?"],
+			},
+			"bad": {
+				"enemy": ["Stay off {memory_detail} — I mean it."],
+			},
+		},
+		TOPIC_SELF: {
+			"good": {
+				"stranger": [
+					"Name's {npc_name}. I {occupation_verb} around here.",
+					"I'm {npc_name}, local {occupation}. Nice to meet you.",
+				],
+			},
+			"mid": {
+				"stranger": ["{npc_name}. {occupation}. That's it."],
+			},
+		},
+		TOPIC_THREAT: {
+			"bad": {
+				"enemy": [
+					"One more step and I'm calling security.",
+					"I said back off, {player}!",
+				],
+				"stranger": [
+					"Keep your distance, friend.",
+				],
+			},
+		},
+		TOPIC_GENERIC: {
+			"good": {
+				"stranger": [
+					"Neon city, endless night. What can I do for you?",
+					"Plenty going on. Anything on your mind?",
+				],
+				"known": [
+					"What's up, {player}?",
+				],
+				"friend": [
+					"{player}! Shoot.",
+				],
+			},
+			"mid": {
+				"stranger": ["Hm.", "Yeah?"],
+			},
+			"bad": {
+				"stranger": ["I don't have time."],
+				"enemy": ["Don't."],
+			},
+		},
+	}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Setup
-# ─────────────────────────────────────────────────────────────────────────────
 
-func setup(npc_brain: Node, npc_economy: Node = null) -> void:
-	brain = npc_brain
-	economy = npc_economy
+# ── Keyword routing ───────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dialogue Session
-# ─────────────────────────────────────────────────────────────────────────────
+const _KEYWORDS: Dictionary = {
+	TOPIC_TRADE: ["buy", "sell", "price", "shop", "store", "stall", "trade", "barter", "cost"],
+	TOPIC_QUEST: ["quest", "job", "mission", "task", "bounty", "contract", "work", "help"],
+	TOPIC_GOSSIP: ["rumor", "rumour", "gossip", "news", "heard", "word", "story"],
+	TOPIC_FACTION: ["faction", "gang", "clan", "territory", "war", "zone"],
+	TOPIC_WEATHER: ["weather", "rain", "storm", "fog", "snow", "clear", "sandstorm"],
+	TOPIC_BUILDING: ["block", "build", "building", "rent", "land", "plot", "property"],
+	TOPIC_SELF: ["who are you", "your name", "yourself", "about you"],
+	TOPIC_GREETING: ["hi", "hey", "hello", "yo ", "greetings"],
+	TOPIC_FAREWELL: ["bye", "later", "farewell", "goodbye", "cya", "see ya"],
+	TOPIC_THREAT: ["die", "kill", "attack", "fight", "shoot"],
+}
 
-func begin_dialogue(player_id: String, player_node: Node) -> void:
-	is_in_dialogue = true
-	current_player_id = player_id
-	current_player_node = player_node
-	session_turn = 0
-	dialogue_history.clear()
 
-	var opening = _generate_opening(player_id)
-	_emit_line(opening)
+func route_topic(player_text: String) -> String:
+	var t: String = player_text.to_lower()
+	# Exact phrase topics first.
+	for topic in [TOPIC_SELF, TOPIC_FAREWELL, TOPIC_GREETING, TOPIC_THREAT]:
+		for kw in _KEYWORDS[topic]:
+			if t.find(kw) != -1:
+				return topic
+	# Then substring topics.
+	for topic in [TOPIC_TRADE, TOPIC_QUEST, TOPIC_GOSSIP, TOPIC_FACTION, TOPIC_WEATHER, TOPIC_BUILDING]:
+		for kw in _KEYWORDS[topic]:
+			if t.find(kw) != -1:
+				return topic
+	return TOPIC_GENERIC
 
-func end_dialogue() -> void:
-	if not is_in_dialogue:
-		return
-	var farewell = _generate_farewell()
-	_emit_line(farewell)
-	is_in_dialogue = false
-	current_player_id = ""
-	current_player_node = null
-	emit_signal("dialogue_ended")
 
-func player_says(player_id: String, message: String) -> void:
-	if not is_in_dialogue:
-		return
-	session_turn += 1
-	var response = _generate_response(player_id, message)
-	_emit_line(response)
+# ── Dialogue generation ───────────────────────────────────────────────
 
-	# Chance to offer quest during conversation
-	if session_turn == 2 and active_quests.size() < MAX_ACTIVE_QUESTS:
-		if _should_offer_quest():
-			var q = generate_quest()
-			if not q.is_empty():
-				emit_signal("quest_offered", q)
-
-	# Chance to share gossip
-	if session_turn >= 3 and randf() < 0.35:
-		_share_gossip_with_player()
-
-func _emit_line(line: String) -> void:
-	dialogue_history.append({"speaker": _get_npc_name(), "line": line})
-	emit_signal("dialogue_line_ready", line)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Opening Lines
-# ─────────────────────────────────────────────────────────────────────────────
-
-func _generate_opening(player_id: String) -> String:
-	if brain == null:
-		return "Hey."
-
-	var has_met: bool = brain.has_met_player(player_id)
-	var trust: float = brain.get_player_trust(player_id)
-	var mood: String = brain.get_mood_label()
-	var friendliness: float = brain.trait_friendliness
-
-	if has_met:
-		return _opening_returning_player(player_id, trust, mood)
+## Generate a line of dialogue for `player_id` / `player_name` given the
+## optional `player_text` (may be empty for greeting / idle barks).
+## Returns a Dictionary: { text, topic, used_memory, quest }
+func generate(player_id: String, player_name: String, player_text: String = "") -> Dictionary:
+	var topic: String
+	if player_text.strip_edges().is_empty():
+		topic = TOPIC_GREETING if not _brain.has_met(player_id) else TOPIC_GENERIC
 	else:
-		return _opening_new_player(friendliness, mood)
+		topic = route_topic(player_text)
 
-func _opening_returning_player(player_id: String, trust: float, mood: String) -> String:
-	var last_mem = brain.recall_latest_memory_about(player_id)
-	var memory_count = brain.get_memory_count(player_id)
-	var npc_name_str = _get_npc_name()
+	var mood_bucket: String = _mood_bucket()
+	var relation: String = _relationship(player_id)
+	var template: String = _pick_template(topic, mood_bucket, relation)
+	var ctx: Dictionary = _build_context(player_id, player_name, topic)
+	var text: String = _fill(template, ctx)
 
-	var recall_line: String = ""
-	if not last_mem.is_empty():
-		var topic: String = last_mem.get("topic", "")
-		var detail: String = last_mem.get("detail", "")
-		match topic:
-			"meeting":
-				recall_line = " We've crossed paths before."
-			"gift":
-				recall_line = " You brought me something last time — I remember."
-			"attack":
-				recall_line = " Last time you weren't so friendly."
-			"building":
-				recall_line = " You mentioned " + detail + " last time."
-			_:
-				recall_line = " I remember you — you mentioned " + detail + "."
-
-	if trust >= 0.5:
-		var lines: Array = [
-			_get_npc_name() + ": " + player_id + "! Good to see a familiar face." + recall_line,
-			_get_npc_name() + ": Back again?" + recall_line + " What brings you this way?",
-			_get_npc_name() + ": Ahh, the one who " + _recall_summary(player_id) + ". Welcome back.",
-		]
-		return lines[randi() % lines.size()]
-	elif trust >= 0.0:
-		var lines: Array = [
-			_get_npc_name() + ": You again." + recall_line,
-			_get_npc_name() + ": I know you." + recall_line + " What do you want?",
-			_get_npc_name() + ": We've met, right?" + recall_line,
-		]
-		return lines[randi() % lines.size()]
-	else:
-		var lines: Array = [
-			_get_npc_name() + ": Oh. You." + recall_line + " What now.",
-			_get_npc_name() + ": Keep your distance." + recall_line,
-			_get_npc_name() + ": I haven't forgotten last time." + recall_line,
-		]
-		return lines[randi() % lines.size()]
-
-func _opening_new_player(friendliness: float, mood: String) -> String:
-	var npc_name_str = _get_npc_name()
-	if friendliness >= 0.7 and mood in ["happy", "content"]:
-		var lines: Array = [
-			npc_name_str + ": Hey! Haven't seen you around before. Name's " + npc_name_str + ". Welcome to the block.",
-			npc_name_str + ": Fresh face! Good timing — it's been quiet around here.",
-			npc_name_str + ": Well, look at you. New arrival? Stick around, this district's got character.",
-		]
-		return lines[randi() % lines.size()]
-	elif friendliness >= 0.4:
-		var lines: Array = [
-			npc_name_str + ": Yo. You lost?",
-			npc_name_str + ": First time in this district?",
-			npc_name_str + ": What's your business here?",
-		]
-		return lines[randi() % lines.size()]
-	else:
-		var lines: Array = [
-			npc_name_str + ": Keep walking if you've got nothing to say.",
-			npc_name_str + ": Not interested in tourists.",
-			npc_name_str + ": Make it quick.",
-		]
-		return lines[randi() % lines.size()]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Response Generation
-# ─────────────────────────────────────────────────────────────────────────────
-
-func _generate_response(player_id: String, message: String) -> String:
-	if brain == null:
-		return "..."
-
-	var msg_lower: String = message.to_lower()
-	var npc_name_str: String = _get_npc_name()
-
-	# Keyword routing
-	if _contains_any(msg_lower, ["quest", "job", "mission", "work", "task"]):
-		return _respond_quest_inquiry(player_id)
-	elif _contains_any(msg_lower, ["buy", "sell", "trade", "shop", "price"]):
-		return _respond_trade_inquiry(player_id)
-	elif _contains_any(msg_lower, ["gossip", "news", "heard", "rumor", "know about"]):
-		return _respond_gossip_inquiry(player_id)
-	elif _contains_any(msg_lower, ["building", "block", "land", "property", "plot"]):
-		brain.store_memory(player_id, "building", message, 0.05)
-		return _respond_building_topic(player_id, message)
-	elif _contains_any(msg_lower, ["who are you", "name", "tell me about yourself"]):
-		return _respond_self_introduction()
-	elif _contains_any(msg_lower, ["weather", "rain", "storm", "sky"]):
-		return _respond_weather()
-	elif _contains_any(msg_lower, ["faction", "corp", "syndicate", "gang", "crew"]):
-		return _respond_faction_topic(player_id)
-	elif _contains_any(msg_lower, ["thanks", "thank you", "cheers", "appreciate"]):
-		brain.apply_mood_boost(0.05)
-		return _respond_thanks()
-	elif _contains_any(msg_lower, ["bye", "later", "goodbye", "see you", "gotta go"]):
-		end_dialogue()
-		return ""
-	elif _contains_any(msg_lower, ["help", "lost", "directions", "where"]):
-		return _respond_directions()
-	else:
-		return _respond_generic(player_id, message)
-
-func _respond_quest_inquiry(player_id: String) -> String:
-	var npc_name_str = _get_npc_name()
-	if active_quests.size() >= MAX_ACTIVE_QUESTS:
-		return npc_name_str + ": I've already got people working on enough. Come back later."
-
-	var occupation = brain.occupation if brain else "civilian"
-	match occupation:
-		"merchant", "shopkeeper":
-			return npc_name_str + ": Actually, I could use someone to fetch a supply run. Payment in credits. You in?"
-		"guard", "security":
-			return npc_name_str + ": There's been suspicious movement near the east perimeter. If you check it out and report back, I'll make it worth your time."
-		"hacker":
-			return npc_name_str + ": There's a data node I need accessed. Encrypted, naturally. If you can crack it, we split the payload."
-		"fixer":
-			return npc_name_str + ": I've got three things that need doing. Pick one — courier run, acquisition, or extraction."
-		_:
-			return npc_name_str + ": I might have something. Let me think on it. Check back tomorrow."
-
-func _respond_trade_inquiry(player_id: String) -> String:
-	var npc_name_str = _get_npc_name()
-	if economy != null and economy.has_method("get_shop_summary"):
-		var summary = economy.get_shop_summary()
-		return npc_name_str + ": Running stock of " + str(summary.get("item_count", 0)) + " items. Prices are " + summary.get("price_trend", "stable") + " right now."
-	var lines: Array = [
-		npc_name_str + ": Depends what you're after. I deal in useful things.",
-		npc_name_str + ": Name your item. I'll tell you if I've got it and what it costs.",
-		npc_name_str + ": Market's been shifty lately. Make me an offer.",
-	]
-	return lines[randi() % lines.size()]
-
-func _respond_gossip_inquiry(player_id: String) -> String:
-	var npc_name_str = _get_npc_name()
-	if gossip_pool.is_empty():
-		return npc_name_str + ": Not much to say lately. The district's been quiet."
-
-	var item = gossip_pool[randi() % gossip_pool.size()]
-	var pid: String = item.get("player_id", "someone")
-	var topic: String = item.get("topic", "things")
-	var source: String = item.get("source_npc", "someone I know")
-
-	return npc_name_str + ": Word is " + pid + " has been dealing in " + topic + ". Heard it from " + source + ". Draw your own conclusions."
-
-func _respond_building_topic(player_id: String, message: String) -> String:
-	var npc_name_str = _get_npc_name()
-	var last = brain.recall_latest_memory_about(player_id) if brain else {}
-	var previous_detail = last.get("detail", "") if not last.is_empty() else ""
-
-	if previous_detail != "" and "block" in previous_detail.to_lower():
-		return npc_name_str + ": Hey, you mentioned " + previous_detail + " last time we spoke. Is that still going?"
-	else:
-		var lines: Array = [
-			npc_name_str + ": Land around here is valuable. People fight over blocks.",
-			npc_name_str + ": Property's the new currency in Neo City. Smart move looking into it.",
-			npc_name_str + ": The west blocks are contested right now. Tread carefully.",
-		]
-		return lines[randi() % lines.size()]
-
-func _respond_self_introduction() -> String:
-	if brain == null:
-		return "Just an NPC."
-	var npc_name_str = _get_npc_name()
-	var occupation: String = brain.occupation
-	var faction: String = brain.faction
-	var mood: String = brain.get_mood_label()
-
-	var personality_phrase: String = _personality_to_phrase()
-	return (npc_name_str + ": Name's " + npc_name_str + ". " + occupation.capitalize() +
-		" by trade, affiliated with " + faction + ". " + personality_phrase +
-		" Currently feeling " + mood + ", if you care.")
-
-func _respond_weather() -> String:
-	var npc_name_str = _get_npc_name()
-	var weather: String = brain.current_weather if brain else "clear"
-	match weather:
-		"rain":
-			return npc_name_str + ": Acid in the air. My implants hate rain."
-		"storm":
-			return npc_name_str + ": Storm's interfering with half the grid. Not ideal."
-		"acid_rain":
-			return npc_name_str + ": Stay under cover. Acid rain corrodes cheap augments."
-		"neon_smog":
-			return npc_name_str + ": Smog's thick today. Corp vents dumping again."
-		_:
-			return npc_name_str + ": Clear enough. Good time to be out in the open."
-
-func _respond_faction_topic(player_id: String) -> String:
-	var npc_name_str = _get_npc_name()
-	if brain == null:
-		return npc_name_str + ": Factions are complicated."
-	var my_faction: String = brain.faction
-	var lines: Array = [
-		npc_name_str + ": I run with " + my_faction + ". We keep our own.",
-		npc_name_str + ": The corps and the syndicates are always at each other's throats. I stay out of it.",
-		npc_name_str + ": Nexus Corp wants control. Shadow Syndicate wants chaos. We just want to live.",
-		npc_name_str + ": Choose your allies carefully. Factions have long memories.",
-	]
-	return lines[randi() % lines.size()]
-
-func _respond_thanks() -> String:
-	var npc_name_str = _get_npc_name()
-	if brain and brain.trait_friendliness >= 0.6:
-		return npc_name_str + ": Anytime. Stay safe out there."
-	elif brain and brain.trait_humor >= 0.6:
-		return npc_name_str + ": Don't mention it. Literally — don't."
-	else:
-		return npc_name_str + ": Sure."
-
-func _respond_directions() -> String:
-	var npc_name_str = _get_npc_name()
-	var lines: Array = [
-		npc_name_str + ": Market district is north, corp towers south. The underground is... underground.",
-		npc_name_str + ": Subway entrance two blocks east. Faster than walking.",
-		npc_name_str + ": Depends where you're going. Be specific.",
-	]
-	return lines[randi() % lines.size()]
-
-func _respond_generic(player_id: String, message: String) -> String:
-	var npc_name_str = _get_npc_name()
-	if brain == null:
-		return npc_name_str + ": Noted."
-
-	brain.store_memory(player_id, "conversation", message.left(80), 0.02)
-
-	var humor: float = brain.trait_humor
-	var wisdom: float = brain.trait_wisdom
-	var mood: String = brain.get_mood_label()
-
-	if humor >= 0.7:
-		var lines: Array = [
-			npc_name_str + ": " + message.left(20) + "... yeah, I've heard stranger things tonight.",
-			npc_name_str + ": That's either brilliant or insane. Maybe both.",
-			npc_name_str + ": Ha. Sure. Why not.",
-		]
-		return lines[randi() % lines.size()]
-	elif wisdom >= 0.7:
-		var lines: Array = [
-			npc_name_str + ": Interesting. There's more to that than people think.",
-			npc_name_str + ": Worth considering from multiple angles.",
-			npc_name_str + ": I've seen enough to know that's not as simple as it sounds.",
-		]
-		return lines[randi() % lines.size()]
-	elif mood == "angry" or mood == "fearful":
-		var lines: Array = [
-			npc_name_str + ": Not now.",
-			npc_name_str + ": I'm not in the mood.",
-			npc_name_str + ": Can you come back when things are less tense?",
-		]
-		return lines[randi() % lines.size()]
-	else:
-		var lines: Array = [
-			npc_name_str + ": Yeah. Sure.",
-			npc_name_str + ": Hm.",
-			npc_name_str + ": I hear you.",
-			npc_name_str + ": Fair enough.",
-		]
-		return lines[randi() % lines.size()]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Farewell
-# ─────────────────────────────────────────────────────────────────────────────
-
-func _generate_farewell() -> String:
-	var npc_name_str = _get_npc_name()
-	if brain == null:
-		return npc_name_str + ": Later."
-
-	var friendliness: float = brain.trait_friendliness
-	var trust: float = brain.get_player_trust(current_player_id) if current_player_id != "" else 0.0
-
-	if friendliness >= 0.6 and trust >= 0.2:
-		var lines: Array = [
-			npc_name_str + ": Watch your back out there.",
-			npc_name_str + ": Come find me if you need anything.",
-			npc_name_str + ": Good talking. Don't be a stranger.",
-		]
-		return lines[randi() % lines.size()]
-	elif trust <= -0.3:
-		var lines: Array = [
-			npc_name_str + ": Don't come back.",
-			npc_name_str + ": I'll remember this.",
-			npc_name_str + ": ...",
-		]
-		return lines[randi() % lines.size()]
-	else:
-		var lines: Array = [
-			npc_name_str + ": Right.",
-			npc_name_str + ": Later.",
-			npc_name_str + ": Stay safe.",
-		]
-		return lines[randi() % lines.size()]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quest Generation
-# ─────────────────────────────────────────────────────────────────────────────
-
-func _should_offer_quest() -> bool:
-	if brain == null:
-		return false
-	var base_chance: float = 0.2
-	base_chance += brain.trait_friendliness * 0.15
-	base_chance += brain.trait_curiosity * 0.1
-	base_chance -= brain.get_player_trust(current_player_id).clampf(-0.1, 0.1) * -0.1
-	return randf() < clampf(base_chance, 0.05, 0.8)
-
-func generate_quest() -> Dictionary:
-	if brain == null:
-		return {}
-
-	var occupation: String = brain.occupation
-	var npc_name_str: String = _get_npc_name()
-	var quest_id: String = npc_id_str() + "_q_" + str(randi() % 9000 + 1000)
-	var trust: float = brain.get_player_trust(current_player_id) if current_player_id != "" else 0.0
+	# If a memory-eligible topic, try to weave in a recall snippet.
+	var used_memory: bool = false
+	if topic in [TOPIC_BUILDING, TOPIC_GREETING, TOPIC_GENERIC]:
+		var recall: Dictionary = _brain.recall_latest_memory_about(player_id)
+		if not recall.is_empty() and _rng.randf() < 0.55:
+			var snippet: String = _memory_snippet(recall)
+			if snippet != "":
+				text = "%s  %s" % [text, snippet]
+				used_memory = true
 
 	var quest: Dictionary = {}
+	if topic == TOPIC_QUEST:
+		quest = generate_quest_for(player_id)
+		if not quest.is_empty():
+			text = "%s  [%s — reward %d credits]" % [text, quest["title"], int(quest["reward"])]
 
-	match occupation:
-		"merchant", "shopkeeper":
-			quest = {
-				"id": quest_id,
-				"giver_npc": npc_id_str(),
-				"title": "Supply Run",
-				"description": "Fetch 5 units of Neon Fuel from the depot at the East Dock. Bring them back undamaged.",
-				"objective_type": "fetch",
-				"target_item": "neon_fuel",
-				"target_count": 5,
-				"reward_credits": 200 + int(trust * 50),
-				"reward_item": "",
-				"difficulty": "easy",
-				"time_limit_hours": 6.0,
-			}
-		"guard", "security":
-			quest = {
-				"id": quest_id,
-				"giver_npc": npc_id_str(),
-				"title": "Perimeter Check",
-				"description": "Suspicious signal detected at Sector 7. Investigate and neutralize any threats.",
-				"objective_type": "investigate",
-				"target_location": "sector_7",
-				"reward_credits": 350,
-				"reward_item": "ammo_pack",
-				"difficulty": "medium",
-				"time_limit_hours": 3.0,
-			}
-		"hacker":
-			quest = {
-				"id": quest_id,
-				"giver_npc": npc_id_str(),
-				"title": "Data Extraction",
-				"description": "There's an encrypted data node at the abandoned factory. I need what's inside. Don't get caught.",
-				"objective_type": "hack",
-				"target_node": "factory_data_node",
-				"reward_credits": 500,
-				"reward_item": "encryption_key",
-				"difficulty": "hard",
-				"time_limit_hours": 4.0,
-			}
-		"fixer":
-			quest = {
-				"id": quest_id,
-				"giver_npc": npc_id_str(),
-				"title": "Package Delivery",
-				"description": "Deliver this package to 'Crow' in the Underground Market. Don't open it. Don't be late.",
-				"objective_type": "deliver",
-				"target_npc": "crow",
-				"reward_credits": 400,
-				"reward_item": "",
-				"difficulty": "medium",
-				"time_limit_hours": 2.0,
-			}
-		"street_vendor":
-			quest = {
-				"id": quest_id,
-				"giver_npc": npc_id_str(),
-				"title": "Competitor Problem",
-				"description": "There's a vendor undercutting my prices nearby. Convince them to move. Peacefully, ideally.",
-				"objective_type": "negotiate",
-				"target_npc": "rival_vendor",
-				"reward_credits": 150,
-				"reward_item": "food_pack",
-				"difficulty": "easy",
-				"time_limit_hours": 8.0,
-			}
+	# Record this interaction so future lines see it.
+	_brain.remember(
+		player_id, player_name,
+		topic,
+		player_text if not player_text.is_empty() else "spoken:" + topic,
+		_sentiment_for(topic, relation),
+	)
+	return {
+		"text": text,
+		"topic": topic,
+		"used_memory": used_memory,
+		"quest": quest,
+	}
+
+
+func _mood_bucket() -> String:
+	if _brain.mood >= 0.25:
+		return "good"
+	if _brain.mood <= -0.25:
+		return "bad"
+	return "mid"
+
+
+func _relationship(player_id: String) -> String:
+	if _brain.is_enemy(player_id):
+		return "enemy"
+	if _brain.is_friend(player_id):
+		return "friend"
+	if _brain.has_met(player_id):
+		return "known"
+	return "stranger"
+
+
+func _pick_template(topic: String, mood_bucket: String, relation: String) -> String:
+	var by_topic: Dictionary = _templates.get(topic, {})
+	var by_mood: Dictionary = by_topic.get(mood_bucket, {})
+	var arr = by_mood.get(relation, [])
+	if typeof(arr) == TYPE_ARRAY and not (arr as Array).is_empty():
+		return _rng_pick(arr)
+	# Fallback 1: same topic & mood, any relation.
+	for rel in ["stranger", "known", "friend", "enemy"]:
+		var a = by_mood.get(rel, [])
+		if typeof(a) == TYPE_ARRAY and not (a as Array).is_empty():
+			return _rng_pick(a)
+	# Fallback 2: same topic, any mood/relation.
+	for mb in ["mid", "good", "bad"]:
+		var m = by_topic.get(mb, {})
+		for rel2 in ["stranger", "known", "friend", "enemy"]:
+			var a2 = m.get(rel2, [])
+			if typeof(a2) == TYPE_ARRAY and not (a2 as Array).is_empty():
+				return _rng_pick(a2)
+	# Fallback 3: generic.
+	if topic != TOPIC_GENERIC:
+		return _pick_template(TOPIC_GENERIC, mood_bucket, relation)
+	return "…"
+
+
+func _rng_pick(arr: Array) -> String:
+	var idx: int = _rng.randi_range(0, arr.size() - 1)
+	return String(arr[idx])
+
+
+func _build_context(player_id: String, player_name: String, topic: String) -> Dictionary:
+	var gossip_target: Dictionary = _pick_gossip_target(player_id)
+	return {
+		"player": player_name if player_name != "" else "stranger",
+		"npc_name": _brain.display_name,
+		"occupation": _brain.occupation,
+		"occupation_verb": _occupation_verb(_brain.occupation),
+		"faction": _brain.faction,
+		"district": _brain.home_district if _brain.home_district != "" else "this block",
+		"weather": _brain.weather_state,
+		"stock_sample": "tonight's stock",
+		"gossip_player": String(gossip_target.get("player_name", "someone")),
+		"gossip_detail": String(gossip_target.get("detail", "rumors")),
+		"memory_detail": _memory_block_hint(player_id),
+	}
+
+
+func _occupation_verb(occ: String) -> String:
+	match occ:
+		NPCBrain.OCC_MERCHANT: return "run a stall"
+		NPCBrain.OCC_GUARD: return "keep the peace"
+		NPCBrain.OCC_BARTENDER: return "pour drinks"
+		NPCBrain.OCC_RIPPERDOC: return "patch up cybernetics"
+		NPCBrain.OCC_HACKER: return "move data"
+		_: return "get by"
+
+
+func _fill(template: String, ctx: Dictionary) -> String:
+	var out: String = template
+	for key in ctx.keys():
+		out = out.replace("{%s}" % key, String(ctx[key]))
+	return out
+
+
+func _memory_snippet(recall: Dictionary) -> String:
+	var topic: String = String(recall.get("topic", ""))
+	var detail: String = String(recall.get("detail", ""))
+	if detail.is_empty():
+		return ""
+	if topic.begins_with("gossip:"):
+		return "I heard something about you — %s." % detail
+	match topic:
+		TOPIC_BUILDING:
+			return "Last time you mentioned %s." % detail
+		TOPIC_TRADE:
+			return "You were asking about %s, right?" % detail
+		TOPIC_QUEST:
+			return "Still on that %s job?" % detail
+		TOPIC_FACTION:
+			return "Still running with %s?" % detail
 		_:
-			quest = {
-				"id": quest_id,
-				"giver_npc": npc_id_str(),
-				"title": "Small Favor",
-				"description": "I need you to deliver a message to someone in the next block. Simple job.",
-				"objective_type": "deliver",
-				"target_npc": "contact_npc",
-				"reward_credits": 100,
-				"reward_item": "",
-				"difficulty": "easy",
-				"time_limit_hours": 12.0,
-			}
+			if detail.length() <= 48:
+				return "Last time you said: \"%s\"." % detail
+	return ""
 
-	active_quests.append(quest)
+
+func _memory_block_hint(player_id: String) -> String:
+	var recall: Dictionary = _brain.recall_latest_memory_about(player_id)
+	if recall.is_empty():
+		return "your block"
+	var d: String = String(recall.get("detail", ""))
+	return d if d != "" else "your block"
+
+
+func _sentiment_for(topic: String, relation: String) -> float:
+	match topic:
+		TOPIC_THREAT: return -0.7
+		TOPIC_FAREWELL: return 0.05
+		TOPIC_GREETING: return 0.1
+		TOPIC_TRADE: return 0.05
+		TOPIC_QUEST: return 0.15
+		TOPIC_GOSSIP: return 0.0
+		_:
+			if relation == "enemy":
+				return -0.1
+			return 0.05
+
+
+# ── Gossip ────────────────────────────────────────────────────────────
+
+func _pick_gossip_target(exclude_player_id: String) -> Dictionary:
+	for i in range(_brain.memory.size() - 1, -1, -1):
+		var e: Dictionary = _brain.memory[i]
+		var pid: String = String(e.get("player_id", ""))
+		if pid == "" or pid == exclude_player_id:
+			continue
+		return e
+	return {}
+
+
+## Package gossip about `player_id` to share with another NPC.
+## Returns {} if nothing to share.
+func share_gossip_with_npc(player_id: String, other_brain, other_dialogue = null) -> Dictionary:
+	var gossip: Dictionary = _brain.export_gossip_about(player_id)
+	if gossip.is_empty() or other_brain == null:
+		return {}
+	# De-duplicate: don't share the same player twice in the dedupe window.
+	var now: float = Time.get_unix_time_from_system()
+	for row in _recent_gossip_log:
+		if row["player_id"] == player_id and (now - float(row["at_unix"])) < GOSSIP_DEDUPE_WINDOW_SECS:
+			return {}
+	_recent_gossip_log.append({
+		"from_npc": _brain.id,
+		"player_id": player_id,
+		"at_unix": now,
+	})
+	while _recent_gossip_log.size() > 32:
+		_recent_gossip_log.pop_front()
+	other_brain.ingest_gossip(gossip)
+	if other_dialogue != null and other_dialogue.has_method("receive_gossip"):
+		other_dialogue.receive_gossip(gossip)
+	return gossip
+
+
+func receive_gossip(gossip: Dictionary) -> void:
+	# The gossip is already stored by NPCBrain.ingest_gossip; here we could
+	# adjust dialogue-specific state (e.g. clear dedupe).  Keep as hook.
+	if gossip.is_empty():
+		return
+	_recent_gossip_log.append({
+		"from_npc": String(gossip.get("from_npc", "")),
+		"player_id": String(gossip.get("player_id", "")),
+		"at_unix": Time.get_unix_time_from_system(),
+	})
+	while _recent_gossip_log.size() > 32:
+		_recent_gossip_log.pop_front()
+
+
+# ── Quest generation ──────────────────────────────────────────────────
+
+const _QUEST_TEMPLATES_BY_OCC: Dictionary = {
+	"merchant": [
+		{"title": "Deliver crate to Block {n}", "type": "delivery", "reward": 150, "difficulty": 1},
+		{"title": "Recover stolen inventory", "type": "retrieve", "reward": 300, "difficulty": 2},
+		{"title": "Escort the shipment", "type": "escort", "reward": 400, "difficulty": 3},
+	],
+	"guard": [
+		{"title": "Clear {n} ganger from District", "type": "combat", "reward": 250, "difficulty": 2},
+		{"title": "Patrol the {district} perimeter", "type": "patrol", "reward": 180, "difficulty": 1},
+		{"title": "Capture the fugitive", "type": "capture", "reward": 500, "difficulty": 3},
+	],
+	"bartender": [
+		{"title": "Collect unpaid tabs", "type": "collect", "reward": 120, "difficulty": 1},
+		{"title": "Eject rowdy patrons", "type": "combat", "reward": 200, "difficulty": 2},
+	],
+	"ripperdoc": [
+		{"title": "Fetch experimental implant part", "type": "fetch", "reward": 350, "difficulty": 2},
+		{"title": "Transport patient discreetly", "type": "escort", "reward": 450, "difficulty": 3},
+	],
+	"hacker": [
+		{"title": "Plant data-leech on corp kiosk", "type": "infiltration", "reward": 500, "difficulty": 3},
+		{"title": "Retrieve encrypted shard from drop", "type": "fetch", "reward": 300, "difficulty": 2},
+	],
+	"civilian": [
+		{"title": "Find my lost {item}", "type": "fetch", "reward": 100, "difficulty": 1},
+		{"title": "Message delivery to Block {n}", "type": "delivery", "reward": 150, "difficulty": 1},
+	],
+}
+
+
+func generate_quest_for(player_id: String) -> Dictionary:
+	if _active_quests.size() >= QUEST_MAX_ACTIVE_PER_NPC:
+		return {}
+	var pool = _QUEST_TEMPLATES_BY_OCC.get(_brain.occupation, _QUEST_TEMPLATES_BY_OCC[NPCBrain.OCC_CIVILIAN])
+	if (pool as Array).is_empty():
+		return {}
+	var tmpl: Dictionary = (pool as Array)[_rng.randi_range(0, pool.size() - 1)]
+	var qid: String = "q_%s_%d" % [_brain.id, Time.get_ticks_msec()]
+	var reward: int = int(tmpl.get("reward", 100))
+	# Trust and mood can give a bonus.
+	reward += int(max(0.0, _brain.trust_of(player_id)) * 50.0)
+	reward += int(max(0.0, _brain.mood) * 40.0)
+	var quest: Dictionary = {
+		"id": qid,
+		"title": _fill(String(tmpl.get("title", "Quest")), {
+			"n": str(_rng.randi_range(1, 99)),
+			"district": _brain.home_district if _brain.home_district != "" else "central",
+			"item": "datashard",
+		}),
+		"type": String(tmpl.get("type", "fetch")),
+		"difficulty": int(tmpl.get("difficulty", 1)),
+		"reward": reward,
+		"giver_npc": _brain.id,
+		"player_id": player_id,
+		"accepted_at": Time.get_unix_time_from_system(),
+		"expires_at": Time.get_unix_time_from_system() + QUEST_DEFAULT_TTL_SECS,
+		"state": "offered",
+	}
+	_active_quests[qid] = quest
 	return quest
 
-func complete_quest(quest_id: String) -> bool:
-	for i in range(active_quests.size()):
-		if active_quests[i].get("id", "") == quest_id:
-			completed_quests.append(active_quests[i])
-			active_quests.remove_at(i)
-			if brain:
-				brain.apply_mood_boost(0.15)
-				if current_player_id != "":
-					brain.store_memory(current_player_id, "quest_complete", "completed quest " + quest_id, 0.4)
-			return true
-	return false
 
-func fail_quest(quest_id: String) -> bool:
-	for i in range(active_quests.size()):
-		if active_quests[i].get("id", "") == quest_id:
-			active_quests.remove_at(i)
-			if brain:
-				brain.apply_mood_boost(-0.1)
-				if current_player_id != "":
-					brain.store_memory(current_player_id, "quest_fail", "failed quest " + quest_id, -0.3)
-			return true
-	return false
+func accept_quest(qid: String, player_id: String) -> bool:
+	if not _active_quests.has(qid):
+		return false
+	var q: Dictionary = _active_quests[qid]
+	if String(q.get("player_id", "")) != player_id:
+		return false
+	q["state"] = "active"
+	_active_quests[qid] = q
+	return true
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Gossip System
-# ─────────────────────────────────────────────────────────────────────────────
 
-func receive_gossip(gossip_entries: Array) -> void:
-	for entry in gossip_entries:
-		gossip_pool.append(entry)
-		if brain:
-			brain.receive_gossip(entry)
+func complete_quest(qid: String, success: bool) -> Dictionary:
+	if not _active_quests.has(qid):
+		return {}
+	var q: Dictionary = _active_quests[qid]
+	q["state"] = "completed" if success else "failed"
+	q["completed_at"] = Time.get_unix_time_from_system()
+	_active_quests.erase(qid)
+	_completed_quest_ids.append(qid)
+	while _completed_quest_ids.size() > 64:
+		_completed_quest_ids.pop_front()
+	return q
 
-	# Trim pool
-	while gossip_pool.size() > MAX_GOSSIP_POOL:
-		gossip_pool.pop_front()
 
-func share_gossip_with_npc(target_npc_dialogue: Node) -> void:
-	if brain == null or target_npc_dialogue == null:
-		return
-	var my_gossip = brain.get_all_gossip_data()
-	if my_gossip.is_empty():
-		return
-	# Share a random subset (up to 5 items)
-	my_gossip.shuffle()
-	var share_count: int = mini(5, my_gossip.size())
-	var to_share: Array = my_gossip.slice(0, share_count)
-	if target_npc_dialogue.has_method("receive_gossip"):
-		target_npc_dialogue.receive_gossip(to_share)
-	emit_signal("gossip_shared", {"target": target_npc_dialogue.npc_id_str(), "items": to_share})
+func active_quests() -> Array:
+	return _active_quests.values()
 
-func _share_gossip_with_player() -> void:
-	if gossip_pool.is_empty():
-		return
-	var item = gossip_pool[randi() % gossip_pool.size()]
-	var npc_name_str = _get_npc_name()
-	var pid: String = item.get("player_id", "someone")
-	var topic: String = item.get("topic", "something")
-	var line: String = npc_name_str + ": By the way, word on the street is that " + pid + " has been involved in " + topic + ". Just saying."
-	_emit_line(line)
 
-func get_gossip_count() -> int:
-	return gossip_pool.size()
+# ── Tick / maintenance ────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Ambient Dialogue (called when not in active session)
-# ─────────────────────────────────────────────────────────────────────────────
-
-func get_ambient_line() -> String:
-	if brain == null:
-		return "..."
-
-	var mood: String = brain.get_mood_label()
-	var weather: String = brain.current_weather
-	var hour: float = brain.current_hour
-	var npc_name_str = _get_npc_name()
-
-	var lines: Array = []
-
-	# Time of day lines
-	if hour >= 0.0 and hour < 6.0:
-		lines.append_array([
-			"Should be asleep by now...",
-			"Night shift never ends.",
-			"The city never sleeps. Neither do I.",
-		])
-	elif hour >= 6.0 and hour < 12.0:
-		lines.append_array([
-			"Another cycle begins.",
-			"Coffee would help. If the dispensers weren't broken again.",
-			"Morning grid checks. Same as always.",
-		])
-	elif hour >= 12.0 and hour < 18.0:
-		lines.append_array([
-			"Midday. Time moves differently here.",
-			"Busy district today.",
-			"Keeping an eye on things.",
-		])
-	else:
-		lines.append_array([
-			"Evening brings out the interesting ones.",
-			"Night market should be setting up soon.",
-			"The corps pull back at night. We come alive.",
-		])
-
-	# Weather lines
-	match weather:
-		"rain":
-			lines.append_array(["This rain is terrible for my circuits.", "At least it keeps the hawkers inside."])
-		"storm":
-			lines.append_array(["Storm's knocked out half the signs.", "Grid's unstable in this weather."])
-		"acid_rain":
-			lines.append_array(["Don't let that stuff touch your skin.", "Acid's eating the paint off everything again."])
-
-	# Mood lines
-	match mood:
-		"happy":
-			lines.append_array(["Good day, all things considered.", "Things are looking up in this district."])
-		"angry":
-			lines.append_array(["Don't even try me right now.", "Someone's going to answer for this."])
-		"fearful":
-			lines.append_array(["Something's off today. Stay alert.", "Keep moving. Don't linger."])
-
-	if lines.is_empty():
-		return "..."
-
-	return lines[randi() % lines.size()]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Utility
-# ─────────────────────────────────────────────────────────────────────────────
-
-func _get_npc_name() -> String:
-	if brain and brain.npc_name != "":
-		return brain.npc_name
-	return "NPC"
-
-func npc_id_str() -> String:
-	if brain and brain.npc_id != "":
-		return brain.npc_id
-	return "unknown_npc"
-
-func _recall_summary(player_id: String) -> String:
-	var entries = brain.recall_memories_about(player_id) if brain else []
-	if entries.is_empty():
-		return "came by before"
-	var last = entries[entries.size() - 1]
-	return last.get("detail", "was here before")
-
-func _personality_to_phrase() -> String:
-	if brain == null:
-		return ""
-	var f: float = brain.trait_friendliness
-	var c: float = brain.trait_curiosity
-	var a: float = brain.trait_aggression
-	var h: float = brain.trait_humor
-	var w: float = brain.trait_wisdom
-
-	if f >= 0.7:
-		return "People say I'm approachable."
-	elif a >= 0.7:
-		return "I don't back down easily."
-	elif w >= 0.7:
-		return "I've seen enough to know how things work."
-	elif h >= 0.7:
-		return "I try not to take things too seriously."
-	elif c >= 0.7:
-		return "Always curious about what's going on."
-	else:
-		return "I keep to myself mostly."
-
-func _contains_any(text: String, keywords: Array) -> bool:
-	for kw in keywords:
-		if kw in text:
-			return true
-	return false
+func tick(delta: float) -> void:
+	var now: float = Time.get_unix_time_from_system()
+	# Expire stale quests.
+	var expired: Array = []
+	for qid in _active_quests.keys():
+		var q: Dictionary = _active_quests[qid]
+		if float(q.get("expires_at", 0.0)) < now:
+			expired.append(qid)
+	for qid in expired:
+		complete_quest(qid, false)
+	# Trim old gossip entries beyond window.
+	var cutoff: float = now - GOSSIP_DEDUPE_WINDOW_SECS * 4.0
+	_recent_gossip_log = _recent_gossip_log.filter(func(r): return float(r["at_unix"]) >= cutoff)

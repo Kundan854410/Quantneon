@@ -1,832 +1,807 @@
-## NPCSpawner.gd
-## Manages NPC spawning, LOD (Level of Detail), day/night cycle,
-## and special event NPC pools for each city district.
-## Spawns 50–100 NPCs per district with full AI for nearby ones
-## and simplified behavior for distant ones.
+## NPCSpawner — Autoload service that instantiates NPCs across the
+## procedural cyberpunk city, drives their per-tick AI, implements a
+## 3-tier LOD system, day/night scheduling, FOMO event NPCs, and cross-
+## NPC gossip + economy ticks.
+##
+## This is the top-level controller — it owns a dictionary of active
+## `NPCBrain` instances keyed by npc_id, an `NPCDialogue` per brain, and
+## delegates shops to the `NPCEconomy` autoload.  Avatars (CharacterBody3D
+## nodes under `/root/.../NPCRoot`) are optional: if present, the spawner
+## drives their `target_position`; if absent, brains still tick "headless".
+##
+## Public API highlights:
+##   • spawn_in_district(district_id, count)
+##   • spawn_event_npcs(event, district, count, duration_hours)
+##   • get_nearest_npc(position, radius) -> npc_id
+##   • player_interact_with_npc(npc_id, player_id, player_node) -> Dictionary
+##   • set_world_time(hour)  / set_weather(state)
 
 extends Node
 
-# ── Signals ─────────────────────────────────────────────────────────────────
+const NPCBrain = preload("res://scripts/ai/NPCBrain.gd")
+const NPCDialogue = preload("res://scripts/ai/NPCDialogue.gd")
+const _NPCEconomyScript = preload("res://scripts/ai/NPCEconomy.gd")
 
-signal npc_spawned(npc_id: String, district: String)
-signal npc_despawned(npc_id: String)
-signal district_populated(district: String, count: int)
-signal day_cycle_changed(is_daytime: bool)
-signal event_npcs_spawned(event_name: String, count: int)
-signal event_npcs_cleared(event_name: String)
-signal lod_updated(npc_id: String, lod_level: int)
+signal npc_spawned(npc_id: String, district_id: String)
+signal npc_despawned(npc_id: String, reason: String)
+signal npc_dialogue(npc_id: String, player_id: String, text: String, topic: String)
+signal fomo_event_started(event_id: String, district_id: String, npc_count: int)
+signal fomo_event_ended(event_id: String)
 
-# ── Configuration ─────────────────────────────────────────────────────────────
+const LOD_FULL_RADIUS: float = 30.0
+const LOD_SIMPLE_RADIUS: float = 80.0
+const LOD_SCHEDULE_RADIUS: float = 150.0
+const LOD_DESPAWN_RADIUS: float = 250.0
 
-@export var min_npcs_per_district: int = 50
-@export var max_npcs_per_district: int = 100
-@export var full_ai_radius: float = 30.0       # meters from player: full AI
-@export var simplified_ai_radius: float = 80.0  # meters: simplified behavior
-@export var despawn_radius: float = 150.0       # meters: despawn NPC
+const LOD_FULL: int = 0
+const LOD_SIMPLE: int = 1
+const LOD_SCHEDULE: int = 2
+const LOD_OFFSCREEN: int = 3
 
-# ── Districts ─────────────────────────────────────────────────────────────────
+const TICK_FULL_HZ: float = 6.0
+const TICK_SIMPLE_HZ: float = 2.0
+const TICK_SCHEDULE_HZ: float = 0.5
+const GOSSIP_TICK_SECS: float = 30.0
+const ECONOMY_TICK_SECS: float = 60.0
+const LOD_RESCAN_SECS: float = 1.0
 
-## district_id -> { name, center, radius, npc_count, npcs, spawn_points, type }
-var districts: Dictionary = {}
+const DISTRICT_CENTRAL: String = "central"
+const DISTRICT_MARKET: String = "market"
+const DISTRICT_INDUSTRIAL: String = "industrial"
+const DISTRICT_RESIDENTIAL: String = "residential"
+const DISTRICT_UNDERGROUND: String = "underground"
+const DISTRICT_CORP: String = "corp"
 
-## Active NPCs: npc_id -> { brain_node, dialogue_node, economy_node, scene_node, district, lod_level }
-var active_npcs: Dictionary = {}
+const _DAWN_HOUR: float = 6.0
+const _DUSK_HOUR: float = 20.0
+const _DUSK_DESPAWN_RATIO: float = 0.4
 
-# ── Day/Night Cycle ────────────────────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────
 
-var current_game_hour: float = 8.0     # 0–24 game time
-var game_time_speed: float = 60.0       # real seconds per game hour
-var is_daytime: bool = true
-var _time_accumulator: float = 0.0
+@export var world_time_speed: float = 60.0  # game seconds per real second
+@export var enable_avatars: bool = false      # if true, requires an avatar scene
+@export var avatar_scene_path: String = "res://scenes/npc.tscn"
+@export var initial_populate_on_ready: bool = false
 
-const DAWN_HOUR: float = 6.0
-const DUSK_HOUR: float = 20.0
+# ── State ─────────────────────────────────────────────────────────────
 
-# ── Player Reference ─────────────────────────────────────────────────────────
+var _rng := RandomNumberGenerator.new()
 
-var player_node: Node3D = null
-var player_position: Vector3 = Vector3.ZERO
+# district_id -> {id, name, type, center, radius, min_npcs, max_npcs,
+#                 occupations, factions, color_hex}
+var _districts: Dictionary = {}
 
-# ── Event NPCs ────────────────────────────────────────────────────────────────
+# npc_id -> { brain, dialogue, avatar (Node|null), lod, last_decision_at,
+#             district_id, faction, spawn_kind ("permanent"|"event"),
+#             event_id, expires_at }
+var _npcs: Dictionary = {}
 
-## event_pools: event_name -> Array of npc_ids
-var event_npc_pools: Dictionary = {}
+# event_id -> { id, district_id, started_at, expires_at, npc_ids: [] }
+var _events: Dictionary = {}
 
-## active_events: Array of { name, district, duration_hours, start_hour, npc_ids }
-var active_events: Array = []
+var _world_hour: float = 12.0
+var _world_weather: String = "clear"
+var _last_dawn_trigger_day: int = -1
+var _last_dusk_trigger_day: int = -1
+var _current_day: int = 0
 
-## Event NPC archetypes for FOMO zones
-const EVENT_ARCHETYPES: Array = [
-	{"role": "event_vendor",   "occupation": "street_vendor",  "faction": "civilian"},
-	{"role": "event_guard",    "occupation": "guard",           "faction": "nexus_corp"},
-	{"role": "event_dancer",   "occupation": "entertainer",     "faction": "civilian"},
-	{"role": "event_reporter", "occupation": "info_broker",     "faction": "civilian"},
-	{"role": "event_medic",    "occupation": "medic",           "faction": "ripperdocs"},
-]
+var _economy: Node
+var _players: Dictionary = {}  # player_id -> {position, district_id, name}
 
-# ── Occupation Templates by District Type ─────────────────────────────────────
+var _lod_rescan_accum: float = 0.0
+var _gossip_accum: float = 0.0
+var _economy_accum: float = 0.0
+var _tick_full_accum: float = 0.0
+var _tick_simple_accum: float = 0.0
+var _tick_schedule_accum: float = 0.0
 
-const DISTRICT_OCCUPATIONS: Dictionary = {
-	"commercial":  ["merchant", "shopkeeper", "street_vendor", "guard", "civilian", "fixer"],
-	"residential": ["civilian", "bartender", "medic", "street_vendor", "courier", "civilian"],
-	"industrial":  ["engineer", "guard", "scavenger", "courier", "hacker", "civilian"],
-	"underground": ["hacker", "smuggler", "fixer", "shadow_dealer", "info_broker", "civilian"],
-	"corporate":   ["guard", "engineer", "info_broker", "courier", "civilian", "fixer"],
-	"market":      ["merchant", "shopkeeper", "street_vendor", "fixer", "civilian", "courier"],
-}
 
-# ── NPC Scene Path (configurable) ─────────────────────────────────────────────
-
-var npc_scene_path: String = "res://scenes/npc_base.tscn"
-var _npc_scene: PackedScene = null
-var _use_scene_instances: bool = false   # false = pure-logic nodes for headless testing
-
-# ── Internal ─────────────────────────────────────────────────────────────────
-
-var _lod_update_timer: float = 0.0
-const LOD_UPDATE_INTERVAL: float = 1.0   # seconds between LOD passes
-
-var _gossip_timer: float = 0.0
-const GOSSIP_INTERVAL: float = 30.0     # seconds between NPC gossip exchanges
-
-var _economy_trade_timer: float = 0.0
-const ECONOMY_TRADE_INTERVAL: float = 60.0
-
-var _npc_id_counter: int = 0
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Lifecycle
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Lifecycle ─────────────────────────────────────────────────────────
 
 func _ready() -> void:
-	_try_load_npc_scene()
+	_rng.randomize()
 	_register_default_districts()
+	_resolve_economy()
+	if initial_populate_on_ready:
+		populate_all_districts()
 	set_process(true)
 
-func _process(delta: float) -> void:
-	_advance_time(delta)
-	_update_lod(delta)
-	_run_gossip_tick(delta)
-	_run_economy_trade_tick(delta)
-	_update_player_position()
-	_check_event_expirations()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# District Registration
-# ─────────────────────────────────────────────────────────────────────────────
+func _resolve_economy() -> void:
+	var n: Node = get_node_or_null("/root/NPCEconomy")
+	if n != null:
+		_economy = n
+	else:
+		# Fall back to a local child instance so the spawner works standalone
+		# in isolated test scenes that don't configure the autoload.
+		var inst: Node = Node.new()
+		inst.set_script(_NPCEconomyScript)
+		inst.name = "NPCEconomyLocal"
+		add_child(inst)
+		_economy = inst
 
-func register_district(district_id: String, district_name: String, center: Vector3,
-		radius: float, district_type: String = "commercial") -> void:
-	districts[district_id] = {
-		"name": district_name,
-		"center": center,
-		"radius": radius,
-		"type": district_type,
-		"npcs": [],
-		"target_npc_count": randi_range(min_npcs_per_district, max_npcs_per_district),
-		"spawn_points": _generate_spawn_points(center, radius, 20),
-	}
+
+# ── District registry ─────────────────────────────────────────────────
 
 func _register_default_districts() -> void:
-	register_district("central",    "Central Plaza",       Vector3(0, 0, 0),      60.0, "commercial")
-	register_district("market",     "Night Market",        Vector3(120, 0, 0),    50.0, "market")
-	register_district("industrial", "Industrial Quarter",  Vector3(-120, 0, 0),   70.0, "industrial")
-	register_district("residential","Residential Zone",    Vector3(0, 0, 120),    55.0, "residential")
-	register_district("underground","Underground Network", Vector3(0, -10, -80),  40.0, "underground")
-	register_district("corporate",  "Corp Towers",         Vector3(-80, 0, -80),  65.0, "corporate")
-
-func _generate_spawn_points(center: Vector3, radius: float, count: int) -> Array:
-	var points: Array = []
-	for i in range(count):
-		var angle: float = (float(i) / float(count)) * PI * 2.0 + randf_range(-0.3, 0.3)
-		var dist: float = randf_range(radius * 0.2, radius * 0.85)
-		points.append(center + Vector3(cos(angle) * dist, 0, sin(angle) * dist))
-	return points
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NPC Spawning
-# ─────────────────────────────────────────────────────────────────────────────
-
-func populate_district(district_id: String) -> void:
-	if not districts.has(district_id):
-		push_warning("[NPCSpawner] Unknown district: " + district_id)
-		return
-
-	var district = districts[district_id]
-	var target: int = district.get("target_npc_count", min_npcs_per_district)
-	var current: int = district["npcs"].size()
-	var to_spawn: int = target - current
-
-	for i in range(to_spawn):
-		_spawn_npc_in_district(district_id)
-
-	emit_signal("district_populated", district_id, district["npcs"].size())
-	print("[NPCSpawner] District '", district_id, "' populated with ", district["npcs"].size(), " NPCs.")
-
-func populate_all_districts() -> void:
-	for district_id in districts.keys():
-		populate_district(district_id)
-
-func _spawn_npc_in_district(district_id: String) -> String:
-	var district = districts[district_id]
-	var occupation: String = _pick_occupation_for_district(district.get("type", "commercial"))
-	var spawn_pos: Vector3 = _pick_spawn_point(district)
-
-	var npc_id: String = _generate_npc_id()
-
-	# Create brain
-	var brain = NPCBrain.new() if _class_exists("NPCBrain") else Node.new()
-	brain.name = "Brain_" + npc_id
-	if brain.has_method("randomize_personality"):
-		brain.randomize_personality()
-	if "occupation" in brain:
-		brain.occupation = occupation
-	if "faction" in brain:
-		brain.faction = _pick_faction_for_district(district.get("type", "commercial"))
-	if "home_district" in brain:
-		brain.home_district = district_id
-	if brain.has_method("update_time"):
-		brain.update_time(current_game_hour)
-
-	# Create dialogue
-	var dialogue = NPCDialogue.new() if _class_exists("NPCDialogue") else Node.new()
-	dialogue.name = "Dialogue_" + npc_id
-	if dialogue.has_method("setup"):
-		dialogue.setup(brain)
-
-	# Create economy (merchants, shopkeepers, vendors, bartenders get shops)
-	var economy: Node = null
-	if occupation in ["merchant", "shopkeeper", "street_vendor", "bartender", "smuggler", "fixer", "shadow_dealer"]:
-		economy = NPCEconomy.new() if _class_exists("NPCEconomy") else Node.new()
-		economy.name = "Economy_" + npc_id
-		if "shop_owner_id" in economy:
-			economy.shop_owner_id = npc_id
-		if "district" in economy:
-			economy.district = district_id
-		if "shop_type" in economy:
-			economy.shop_type = _pick_shop_type(occupation)
-		if economy.has_method("set_time"):
-			economy.set_time(current_game_hour)
-		if dialogue.has_method("setup"):
-			dialogue.setup(brain, economy)
-
-	# Create scene node (or logic node)
-	var scene_node: Node3D = _create_npc_scene_node(npc_id, spawn_pos)
-
-	# Attach sub-systems
-	if scene_node:
-		scene_node.add_child(brain)
-		scene_node.add_child(dialogue)
-		if economy:
-			scene_node.add_child(economy)
-		get_tree().root.add_child(scene_node)
-
-	# Register
-	active_npcs[npc_id] = {
-		"brain":      brain,
-		"dialogue":   dialogue,
-		"economy":    economy,
-		"scene_node": scene_node,
-		"district":   district_id,
-		"lod_level":  0,
-		"position":   spawn_pos,
-	}
-
-	district["npcs"].append(npc_id)
-	emit_signal("npc_spawned", npc_id, district_id)
-	return npc_id
-
-func _create_npc_scene_node(npc_id: String, position: Vector3) -> Node3D:
-	if _use_scene_instances and _npc_scene != null:
-		var instance = _npc_scene.instantiate()
-		if "npc_id" in instance:
-			instance.npc_id = npc_id
-		instance.position = position
-		instance.name = "NPC_" + npc_id
-		return instance
-	else:
-		# Lightweight stand-in for pure-logic mode
-		var node = Node3D.new()
-		node.name = "NPC_" + npc_id
-		node.position = position
-		return node
-
-func despawn_npc(npc_id: String) -> void:
-	if not active_npcs.has(npc_id):
-		return
-	var record = active_npcs[npc_id]
-	var district_id: String = record.get("district", "")
-
-	if record.get("scene_node") != null:
-		record["scene_node"].queue_free()
-
-	if districts.has(district_id):
-		districts[district_id]["npcs"].erase(npc_id)
-
-	active_npcs.erase(npc_id)
-	emit_signal("npc_despawned", npc_id)
-
-func despawn_all_in_district(district_id: String) -> void:
-	if not districts.has(district_id):
-		return
-	var npc_list: Array = districts[district_id]["npcs"].duplicate()
-	for npc_id in npc_list:
-		despawn_npc(npc_id)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LOD System
-# ─────────────────────────────────────────────────────────────────────────────
-
-## LOD levels:
-##  0 = full AI (within full_ai_radius)
-##  1 = simplified AI (within simplified_ai_radius)
-##  2 = inactive / schedule-only (beyond simplified_ai_radius)
-##  3 = despawned (beyond despawn_radius)
-
-func _update_lod(delta: float) -> void:
-	_lod_update_timer += delta
-	if _lod_update_timer < LOD_UPDATE_INTERVAL:
-		return
-	_lod_update_timer = 0.0
-
-	if player_node == null:
-		return
-
-	for npc_id in active_npcs.keys():
-		var record = active_npcs[npc_id]
-		var npc_pos: Vector3 = _get_npc_position(record)
-		var dist: float = player_position.distance_to(npc_pos)
-
-		var new_lod: int = _calculate_lod(dist)
-		if new_lod != record.get("lod_level", 0):
-			record["lod_level"] = new_lod
-			_apply_lod(npc_id, record, new_lod)
-			emit_signal("lod_updated", npc_id, new_lod)
-
-func _calculate_lod(distance: float) -> int:
-	if distance <= full_ai_radius:
-		return 0
-	elif distance <= simplified_ai_radius:
-		return 1
-	elif distance <= despawn_radius:
-		return 2
-	else:
-		return 3
-
-func _apply_lod(npc_id: String, record: Dictionary, lod_level: int) -> void:
-	var brain = record.get("brain")
-	var scene_node = record.get("scene_node")
-
-	match lod_level:
-		0:
-			# Full AI — enable all processing
-			if brain and brain.has_method("set_lod_simplified"):
-				brain.set_lod_simplified(false)
-			if brain:
-				brain.set_process(true)
-			if scene_node:
-				scene_node.visible = true
-				scene_node.set_process(true)
-				scene_node.set_physics_process(true)
-		1:
-			# Simplified AI — brain runs but less frequently
-			if brain and brain.has_method("set_lod_simplified"):
-				brain.set_lod_simplified(true)
-			if brain:
-				brain.set_process(true)
-			if scene_node:
-				scene_node.visible = true
-				scene_node.set_physics_process(false)
-		2:
-			# Schedule only — brain ticks but no physics/rendering
-			if brain and brain.has_method("set_lod_simplified"):
-				brain.set_lod_simplified(true)
-			if brain:
-				brain.set_process(true)
-			if scene_node:
-				scene_node.visible = false
-				scene_node.set_process(false)
-				scene_node.set_physics_process(false)
-		3:
-			# Despawn
-			despawn_npc(npc_id)
-
-func _get_npc_position(record: Dictionary) -> Vector3:
-	var scene_node = record.get("scene_node")
-	if scene_node and scene_node is Node3D:
-		return scene_node.global_position
-	return record.get("position", Vector3.ZERO)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Day/Night Cycle
-# ─────────────────────────────────────────────────────────────────────────────
-
-func _advance_time(delta: float) -> void:
-	_time_accumulator += delta
-	if _time_accumulator >= game_time_speed:
-		_time_accumulator -= game_time_speed
-		current_game_hour = fmod(current_game_hour + 1.0, 24.0)
-		_on_hour_changed()
-
-func _on_hour_changed() -> void:
-	var was_daytime: bool = is_daytime
-	is_daytime = current_game_hour >= DAWN_HOUR and current_game_hour < DUSK_HOUR
-
-	if is_daytime != was_daytime:
-		emit_signal("day_cycle_changed", is_daytime)
-		if is_daytime:
-			_on_dawn()
-		else:
-			_on_dusk()
-
-	# Push time update to all NPC brains
-	for npc_id in active_npcs.keys():
-		var record = active_npcs[npc_id]
-		var brain = record.get("brain")
-		if brain and brain.has_method("update_time"):
-			brain.update_time(current_game_hour)
-		var economy = record.get("economy")
-		if economy and economy.has_method("set_time"):
-			economy.set_time(current_game_hour)
-
-func _on_dawn() -> void:
-	print("[NPCSpawner] Dawn — NPCs returning to daytime schedules.")
-	# Spawn any districts that went below minimum at night
-	for district_id in districts.keys():
-		var district = districts[district_id]
-		if district["npcs"].size() < min_npcs_per_district:
-			var deficit: int = min_npcs_per_district - district["npcs"].size()
-			for i in range(deficit):
-				_spawn_npc_in_district(district_id)
-
-func _on_dusk() -> void:
-	print("[NPCSpawner] Dusk — NPCs transitioning to night schedules.")
-	# Some NPCs leave at night — reduce to 60% of daytime population
-	for district_id in districts.keys():
-		if district_id == "underground":
-			continue   # underground doesn't empty at night
-		var district = districts[district_id]
-		var target_night: int = int(district["npcs"].size() * 0.6)
-		var to_remove: int = district["npcs"].size() - target_night
-		var npc_list = district["npcs"].duplicate()
-		npc_list.shuffle()
-		for i in range(mini(to_remove, npc_list.size())):
-			despawn_npc(npc_list[i])
-
-func set_game_hour(hour: float) -> void:
-	current_game_hour = fmod(hour, 24.0)
-	is_daytime = current_game_hour >= DAWN_HOUR and current_game_hour < DUSK_HOUR
-	_on_hour_changed()
-
-func get_game_hour() -> float:
-	return current_game_hour
-
-func set_time_speed(real_seconds_per_game_hour: float) -> void:
-	game_time_speed = maxf(1.0, real_seconds_per_game_hour)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Event NPC System (FOMO Zones)
-# ─────────────────────────────────────────────────────────────────────────────
-
-func spawn_event_npcs(event_name: String, district_id: String,
-		npc_count: int = 10, duration_hours: float = 4.0) -> void:
-	if not districts.has(district_id):
-		push_warning("[NPCSpawner] Cannot spawn event NPCs: unknown district " + district_id)
-		return
-
-	var spawned_ids: Array = []
-
-	for i in range(npc_count):
-		var archetype = EVENT_ARCHETYPES[i % EVENT_ARCHETYPES.size()]
-		var npc_id: String = _spawn_event_npc(district_id, archetype, event_name)
-		spawned_ids.append(npc_id)
-
-		# Notify brain of the active event
-		var brain = active_npcs[npc_id].get("brain") if active_npcs.has(npc_id) else null
-		if brain and brain.has_method("register_faction_event"):
-			brain.register_faction_event({
-				"name": event_name,
-				"type": "fomo_zone",
-				"faction": "civilian",
-				"district": district_id,
-			})
-
-	event_npc_pools[event_name] = spawned_ids
-
-	active_events.append({
-		"name": event_name,
-		"district": district_id,
-		"duration_hours": duration_hours,
-		"start_hour": current_game_hour,
-		"npc_ids": spawned_ids,
+	register_district({
+		"id": DISTRICT_CENTRAL,
+		"name": "Central Plaza",
+		"type": "mixed",
+		"center": Vector3(0, 0, 0),
+		"radius": 90.0,
+		"min_npcs": 55,
+		"max_npcs": 80,
+		"occupations": [
+			NPCBrain.OCC_CIVILIAN, NPCBrain.OCC_MERCHANT, NPCBrain.OCC_GUARD,
+		],
+		"factions": ["neutral", "merchants", "neon_authority"],
+	})
+	register_district({
+		"id": DISTRICT_MARKET,
+		"name": "Night Market",
+		"type": "commercial",
+		"center": Vector3(150, 0, -90),
+		"radius": 70.0,
+		"min_npcs": 60,
+		"max_npcs": 90,
+		"occupations": [
+			NPCBrain.OCC_MERCHANT, NPCBrain.OCC_BARTENDER, NPCBrain.OCC_CIVILIAN,
+		],
+		"factions": ["merchants", "neutral", "street_lords"],
+	})
+	register_district({
+		"id": DISTRICT_INDUSTRIAL,
+		"name": "Industrial Sector",
+		"type": "industrial",
+		"center": Vector3(-180, 0, 120),
+		"radius": 100.0,
+		"min_npcs": 50,
+		"max_npcs": 70,
+		"occupations": [
+			NPCBrain.OCC_CIVILIAN, NPCBrain.OCC_GUARD, NPCBrain.OCC_MERCHANT,
+		],
+		"factions": ["corp_drones", "street_lords", "neutral"],
+	})
+	register_district({
+		"id": DISTRICT_RESIDENTIAL,
+		"name": "Residential Blocks",
+		"type": "residential",
+		"center": Vector3(60, 0, 200),
+		"radius": 120.0,
+		"min_npcs": 65,
+		"max_npcs": 100,
+		"occupations": [
+			NPCBrain.OCC_CIVILIAN, NPCBrain.OCC_MERCHANT, NPCBrain.OCC_RIPPERDOC,
+		],
+		"factions": ["neutral", "merchants"],
+	})
+	register_district({
+		"id": DISTRICT_UNDERGROUND,
+		"name": "Underground",
+		"type": "underground",
+		"center": Vector3(-60, -5, -180),
+		"radius": 80.0,
+		"min_npcs": 50,
+		"max_npcs": 85,
+		"occupations": [
+			NPCBrain.OCC_HACKER, NPCBrain.OCC_RIPPERDOC, NPCBrain.OCC_BARTENDER,
+			NPCBrain.OCC_CIVILIAN,
+		],
+		"factions": ["netrunners", "street_lords", "neutral"],
+	})
+	register_district({
+		"id": DISTRICT_CORP,
+		"name": "Corp Towers",
+		"type": "corporate",
+		"center": Vector3(220, 0, 220),
+		"radius": 90.0,
+		"min_npcs": 55,
+		"max_npcs": 75,
+		"occupations": [
+			NPCBrain.OCC_GUARD, NPCBrain.OCC_CIVILIAN, NPCBrain.OCC_MERCHANT,
+		],
+		"factions": ["corp_drones", "neon_authority"],
 	})
 
-	# Force shops open during event
-	for npc_id in spawned_ids:
-		var economy = active_npcs[npc_id].get("economy") if active_npcs.has(npc_id) else null
-		if economy and "special_event_open" in economy:
-			economy.special_event_open = true
 
-	emit_signal("event_npcs_spawned", event_name, npc_count)
-	print("[NPCSpawner] Event '", event_name, "' spawned ", npc_count, " NPCs in district '", district_id, "'.")
+func register_district(d: Dictionary) -> void:
+	if not d.has("id"):
+		return
+	_districts[String(d["id"])] = d
 
-func _spawn_event_npc(district_id: String, archetype: Dictionary, event_name: String) -> String:
-	var occupation: String = archetype.get("occupation", "civilian")
-	var faction: String = archetype.get("faction", "civilian")
-	var role: String = archetype.get("role", "event_npc")
 
-	var district = districts[district_id]
-	var spawn_pos: Vector3 = _pick_spawn_point(district)
-	var npc_id: String = _generate_npc_id()
+func get_district(district_id: String) -> Dictionary:
+	return _districts.get(district_id, {})
 
-	var brain = NPCBrain.new() if _class_exists("NPCBrain") else Node.new()
-	brain.name = "Brain_" + npc_id
-	if brain.has_method("randomize_personality"):
-		brain.randomize_personality()
-	if "occupation" in brain:
-		brain.occupation = occupation
-	if "faction" in brain:
-		brain.faction = faction
-	if "home_district" in brain:
-		brain.home_district = district_id
-	if "trait_friendliness" in brain:
-		brain.trait_friendliness = 0.8   # event NPCs are more sociable
 
-	var dialogue = NPCDialogue.new() if _class_exists("NPCDialogue") else Node.new()
-	dialogue.name = "Dialogue_" + npc_id
+# ── Population ────────────────────────────────────────────────────────
 
-	var economy: Node = null
-	if occupation in ["street_vendor", "merchant", "fixer"]:
-		economy = NPCEconomy.new() if _class_exists("NPCEconomy") else Node.new()
-		economy.name = "Economy_" + npc_id
-		if "shop_owner_id" in economy:
-			economy.shop_owner_id = npc_id
-		if "district" in economy:
-			economy.district = district_id
-		if "shop_type" in economy:
-			economy.shop_type = "general"
+func populate_all_districts() -> void:
+	for id in _districts.keys():
+		var d: Dictionary = _districts[id]
+		var target: int = _rng.randi_range(int(d["min_npcs"]), int(d["max_npcs"]))
+		spawn_in_district(String(id), target)
 
-	if dialogue.has_method("setup"):
-		dialogue.setup(brain, economy)
 
-	var scene_node: Node3D = _create_npc_scene_node(npc_id, spawn_pos)
-	if scene_node:
-		scene_node.add_child(brain)
-		scene_node.add_child(dialogue)
-		if economy:
-			scene_node.add_child(economy)
-		get_tree().root.add_child(scene_node)
+func spawn_in_district(district_id: String, count: int) -> Array:
+	var d: Dictionary = _districts.get(district_id, {})
+	if d.is_empty() or count <= 0:
+		return []
+	var spawned: Array = []
+	var occupations: Array = d.get("occupations", [NPCBrain.OCC_CIVILIAN])
+	var factions: Array = d.get("factions", ["neutral"])
+	for i in range(count):
+		var occ: String = String(occupations[_rng.randi_range(0, occupations.size() - 1)])
+		var fac: String = String(factions[_rng.randi_range(0, factions.size() - 1)])
+		var pos: Vector3 = _random_point_in_district(d)
+		var npc_id: String = _spawn_one("permanent", district_id, occ, fac, pos)
+		if npc_id != "":
+			spawned.append(npc_id)
+	return spawned
 
-	active_npcs[npc_id] = {
-		"brain":      brain,
-		"dialogue":   dialogue,
-		"economy":    economy,
-		"scene_node": scene_node,
-		"district":   district_id,
-		"lod_level":  0,
-		"position":   spawn_pos,
-		"is_event_npc": true,
-		"event_name": event_name,
+
+func _spawn_one(kind: String, district_id: String, occupation: String, faction: String, pos: Vector3, event_id: String = "", expires_at: float = 0.0) -> String:
+	var npc_id: String = "npc_%s_%d_%d" % [district_id, Time.get_ticks_msec(), _rng.randi()]
+	var display_name: String = _random_name(occupation)
+	var brain := NPCBrain.new(npc_id, display_name, occupation)
+	brain.faction = faction
+	brain.home_district = district_id
+	brain.home_position = pos
+	brain.current_position = pos
+	brain.world_time_hour = _world_hour
+	brain.weather_state = _world_weather
+	var dialogue := NPCDialogue.new(brain)
+
+	var avatar: Node = null
+	if enable_avatars:
+		avatar = _spawn_avatar(pos)
+
+	_npcs[npc_id] = {
+		"brain": brain,
+		"dialogue": dialogue,
+		"avatar": avatar,
+		"lod": LOD_SCHEDULE,
+		"last_decision_at": 0.0,
+		"district_id": district_id,
+		"faction": faction,
+		"spawn_kind": kind,
+		"event_id": event_id,
+		"expires_at": expires_at,
 	}
 
-	district["npcs"].append(npc_id)
+	if _economy != null and _economy.has_method("auto_attach_shop_by_occupation"):
+		_economy.auto_attach_shop_by_occupation(npc_id, occupation, district_id)
+
+	npc_spawned.emit(npc_id, district_id)
 	return npc_id
 
-func clear_event_npcs(event_name: String) -> void:
-	if not event_npc_pools.has(event_name):
-		return
 
-	var npc_list: Array = event_npc_pools[event_name].duplicate()
-	for npc_id in npc_list:
-		despawn_npc(npc_id)
-
-	event_npc_pools.erase(event_name)
-
-	for i in range(active_events.size() - 1, -1, -1):
-		if active_events[i].get("name", "") == event_name:
-			active_events.remove_at(i)
-
-	emit_signal("event_npcs_cleared", event_name)
-	print("[NPCSpawner] Cleared event NPCs for '", event_name, "'.")
-
-func _check_event_expirations() -> void:
-	for i in range(active_events.size() - 1, -1, -1):
-		var event = active_events[i]
-		var start: float = event.get("start_hour", 0.0)
-		var duration: float = event.get("duration_hours", 4.0)
-		var elapsed: float = fmod(current_game_hour - start + 24.0, 24.0)
-		if elapsed >= duration:
-			clear_event_npcs(event.get("name", ""))
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Gossip Exchange
-# ─────────────────────────────────────────────────────────────────────────────
-
-func _run_gossip_tick(delta: float) -> void:
-	_gossip_timer += delta
-	if _gossip_timer < GOSSIP_INTERVAL:
-		return
-	_gossip_timer = 0.0
-	_perform_gossip_exchange()
-
-func _perform_gossip_exchange() -> void:
-	var npc_ids: Array = active_npcs.keys()
-	if npc_ids.size() < 2:
-		return
-
-	# Randomly pick pairs of nearby NPCs to gossip
-	npc_ids.shuffle()
-	var pair_count: int = mini(5, npc_ids.size() / 2)
-	for i in range(pair_count):
-		var id_a: String = npc_ids[i * 2]
-		var id_b: String = npc_ids[i * 2 + 1]
-
-		var record_a = active_npcs.get(id_a, {})
-		var record_b = active_npcs.get(id_b, {})
-
-		var pos_a: Vector3 = _get_npc_position(record_a)
-		var pos_b: Vector3 = _get_npc_position(record_b)
-
-		if pos_a.distance_to(pos_b) > 20.0:
-			continue   # too far apart for gossip
-
-		var dialogue_a = record_a.get("dialogue")
-		var dialogue_b = record_b.get("dialogue")
-
-		if dialogue_a and dialogue_a.has_method("share_gossip_with_npc") and dialogue_b:
-			dialogue_a.share_gossip_with_npc(dialogue_b)
-		if dialogue_b and dialogue_b.has_method("share_gossip_with_npc") and dialogue_a:
-			dialogue_b.share_gossip_with_npc(dialogue_a)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Economy Trade Tick
-# ─────────────────────────────────────────────────────────────────────────────
-
-func _run_economy_trade_tick(delta: float) -> void:
-	_economy_trade_timer += delta
-	if _economy_trade_timer < ECONOMY_TRADE_INTERVAL:
-		return
-	_economy_trade_timer = 0.0
-	_perform_npc_economy_trades()
-
-func _perform_npc_economy_trades() -> void:
-	var merchants: Array = []
-	for npc_id in active_npcs.keys():
-		var record = active_npcs[npc_id]
-		if record.get("economy") != null:
-			merchants.append(record)
-
-	if merchants.size() < 2:
-		return
-
-	merchants.shuffle()
-	var trade_pairs: int = mini(3, merchants.size() / 2)
-	for i in range(trade_pairs):
-		var econ_a = merchants[i * 2].get("economy")
-		var econ_b = merchants[i * 2 + 1].get("economy")
-		if econ_a and econ_a.has_method("initiate_npc_trade") and econ_b:
-			econ_a.initiate_npc_trade(econ_b)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Player Tracking
-# ─────────────────────────────────────────────────────────────────────────────
-
-func set_player(p: Node3D) -> void:
-	player_node = p
-
-func _update_player_position() -> void:
-	if player_node != null and player_node is Node3D:
-		player_position = player_node.global_position
-		_update_nearby_player_counts()
-
-func _update_nearby_player_counts() -> void:
-	for district_id in districts.keys():
-		var district = districts[district_id]
-		var center: Vector3 = district.get("center", Vector3.ZERO)
-		var radius: float = district.get("radius", 50.0)
-		var player_nearby: bool = player_position.distance_to(center) <= radius
-
-		for npc_id in district.get("npcs", []):
-			var record = active_npcs.get(npc_id, {})
-			var economy = record.get("economy")
-			if economy and economy.has_method("set_nearby_player_count"):
-				economy.set_nearby_player_count(1 if player_nearby else 0)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Interact With NPC
-# ─────────────────────────────────────────────────────────────────────────────
-
-func get_nearest_npc(from_position: Vector3, max_distance: float = 5.0) -> String:
-	var nearest_id: String = ""
-	var nearest_dist: float = max_distance + 1.0
-
-	for npc_id in active_npcs.keys():
-		var record = active_npcs[npc_id]
-		var npc_pos: Vector3 = _get_npc_position(record)
-		var dist: float = from_position.distance_to(npc_pos)
-		if dist < nearest_dist:
-			nearest_dist = dist
-			nearest_id = npc_id
-
-	return nearest_id
-
-func player_interact_with_npc(npc_id: String, player_id: String, player_node_ref: Node) -> bool:
-	if not active_npcs.has(npc_id):
-		return false
-
-	var record = active_npcs[npc_id]
-	var brain = record.get("brain")
-	var dialogue = record.get("dialogue")
-
-	if brain and brain.has_method("on_player_interaction"):
-		brain.on_player_interaction(player_id, player_node_ref)
-
-	if dialogue and dialogue.has_method("begin_dialogue"):
-		dialogue.begin_dialogue(player_id, player_node_ref)
-		return true
-
-	return false
-
-func get_npc_brain(npc_id: String) -> Node:
-	if not active_npcs.has(npc_id):
+func _spawn_avatar(pos: Vector3) -> Node:
+	if avatar_scene_path.is_empty():
 		return null
-	return active_npcs[npc_id].get("brain")
-
-func get_npc_dialogue(npc_id: String) -> Node:
-	if not active_npcs.has(npc_id):
+	if not ResourceLoader.exists(avatar_scene_path):
 		return null
-	return active_npcs[npc_id].get("dialogue")
-
-func get_npc_economy(npc_id: String) -> Node:
-	if not active_npcs.has(npc_id):
+	var packed: PackedScene = load(avatar_scene_path)
+	if packed == null:
 		return null
-	return active_npcs[npc_id].get("economy")
+	var inst: Node = packed.instantiate()
+	if inst is Node3D:
+		(inst as Node3D).global_position = pos
+	add_child(inst)
+	return inst
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Weather Broadcast
-# ─────────────────────────────────────────────────────────────────────────────
 
-func broadcast_weather(weather: String) -> void:
-	for npc_id in active_npcs.keys():
-		var brain = active_npcs[npc_id].get("brain")
-		if brain and brain.has_method("update_weather"):
-			brain.update_weather(weather)
+func despawn(npc_id: String, reason: String = "generic") -> void:
+	if not _npcs.has(npc_id):
+		return
+	var rec: Dictionary = _npcs[npc_id]
+	var avatar = rec.get("avatar", null)
+	if avatar != null and is_instance_valid(avatar):
+		avatar.queue_free()
+	if _economy != null and _economy.has_method("detach_shop"):
+		_economy.detach_shop(npc_id)
+	_npcs.erase(npc_id)
+	npc_despawned.emit(npc_id, reason)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Faction Events
-# ─────────────────────────────────────────────────────────────────────────────
 
-func broadcast_faction_event(event: Dictionary, district_id: String = "") -> void:
-	for npc_id in active_npcs.keys():
-		var record = active_npcs[npc_id]
-		if district_id != "" and record.get("district", "") != district_id:
-			continue
-		var brain = record.get("brain")
-		if brain and brain.has_method("register_faction_event"):
-			brain.register_faction_event(event)
+func _random_point_in_district(d: Dictionary) -> Vector3:
+	var center: Vector3 = d.get("center", Vector3.ZERO)
+	var radius: float = float(d.get("radius", 50.0))
+	var angle: float = _rng.randf() * TAU
+	var r: float = sqrt(_rng.randf()) * radius  # uniform over disk
+	return center + Vector3(cos(angle) * r, 0.0, sin(angle) * r)
 
-func clear_faction_events(district_id: String = "") -> void:
-	for npc_id in active_npcs.keys():
-		var record = active_npcs[npc_id]
-		if district_id != "" and record.get("district", "") != district_id:
-			continue
-		var brain = record.get("brain")
-		if brain and brain.has_method("clear_faction_events"):
-			brain.clear_faction_events()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Statistics
-# ─────────────────────────────────────────────────────────────────────────────
+const _FIRST_NAMES: Array = [
+	"Kai", "Ren", "Nova", "Jax", "Vex", "Lyra", "Orion", "Zara",
+	"Echo", "Raven", "Silas", "Mira", "Axel", "Nyx", "Drax", "Kira",
+	"Tez", "Yuki", "Cass", "Blaze", "Quinn", "Wren", "Ash", "Indra",
+]
+const _LAST_NAMES: Array = [
+	"Kuro", "Silver", "Wire", "Neon", "Vance", "Steel", "Cipher", "Volt",
+	"Rook", "Circuit", "Static", "Ronin", "Ghost", "Drift", "Echo", "Zero",
+]
+const _OCC_TITLES: Dictionary = {
+	"civilian": "",
+	"merchant": "the Vendor",
+	"guard": "the Guard",
+	"ripperdoc": "the Ripper",
+	"bartender": "the Pourer",
+	"hacker": "the Netrunner",
+}
 
-func get_spawn_stats() -> Dictionary:
-	var total_npcs: int = active_npcs.size()
-	var by_district: Dictionary = {}
-	var by_lod: Dictionary = {0: 0, 1: 0, 2: 0}
-	var merchants: int = 0
-	var event_npcs: int = 0
 
-	for npc_id in active_npcs.keys():
-		var record = active_npcs[npc_id]
-		var district_id: String = record.get("district", "unknown")
-		by_district[district_id] = by_district.get(district_id, 0) + 1
-		var lod: int = record.get("lod_level", 0)
-		by_lod[lod] = by_lod.get(lod, 0) + 1
-		if record.get("economy") != null:
-			merchants += 1
-		if record.get("is_event_npc", false):
-			event_npcs += 1
+func _random_name(occupation: String) -> String:
+	var first: String = _FIRST_NAMES[_rng.randi_range(0, _FIRST_NAMES.size() - 1)]
+	var last: String = _LAST_NAMES[_rng.randi_range(0, _LAST_NAMES.size() - 1)]
+	var title: String = String(_OCC_TITLES.get(occupation, ""))
+	if title.is_empty():
+		return "%s %s" % [first, last]
+	return "%s %s, %s" % [first, last, title]
 
-	return {
-		"total": total_npcs,
-		"by_district": by_district,
-		"by_lod": by_lod,
-		"merchants": merchants,
-		"event_npcs": event_npcs,
-		"is_daytime": is_daytime,
-		"game_hour": current_game_hour,
-		"active_events": active_events.size(),
+
+# ── FOMO event NPCs ───────────────────────────────────────────────────
+
+const _EVENT_ARCHETYPES: Dictionary = {
+	"vendor": {"occupation": "merchant", "faction": "merchants"},
+	"guard": {"occupation": "guard", "faction": "neon_authority"},
+	"dancer": {"occupation": "civilian", "faction": "neutral"},
+	"reporter": {"occupation": "civilian", "faction": "neutral"},
+	"medic": {"occupation": "ripperdoc", "faction": "neutral"},
+}
+
+
+func spawn_event_npcs(event_id: String, district_id: String, count: int, duration_hours: float) -> Array:
+	var d: Dictionary = _districts.get(district_id, {})
+	if d.is_empty() or count <= 0 or duration_hours <= 0.0:
+		return []
+	var expires_at: float = Time.get_unix_time_from_system() + duration_hours * 3600.0
+	var archetype_keys: Array = _EVENT_ARCHETYPES.keys()
+	var ids: Array = []
+	for i in range(count):
+		var arch_key: String = String(archetype_keys[_rng.randi_range(0, archetype_keys.size() - 1)])
+		var arch: Dictionary = _EVENT_ARCHETYPES[arch_key]
+		var pos: Vector3 = _random_point_in_district(d)
+		var npc_id: String = _spawn_one(
+			"event", district_id,
+			String(arch["occupation"]), String(arch["faction"]),
+			pos, event_id, expires_at,
+		)
+		if npc_id != "":
+			ids.append(npc_id)
+			# Event vendors keep shops open around the clock.
+			if _economy != null and _economy.has_method("get_shop"):
+				var shop: Dictionary = _economy.get_shop(npc_id)
+				if not shop.is_empty():
+					shop["force_open"] = true
+	_events[event_id] = {
+		"id": event_id,
+		"district_id": district_id,
+		"started_at": Time.get_unix_time_from_system(),
+		"expires_at": expires_at,
+		"npc_ids": ids,
 	}
+	fomo_event_started.emit(event_id, district_id, ids.size())
+	return ids
 
-func get_district_info(district_id: String) -> Dictionary:
-	if not districts.has(district_id):
-		return {}
-	var d = districts[district_id]
-	return {
-		"id": district_id,
-		"name": d.get("name", ""),
-		"type": d.get("type", ""),
-		"npc_count": d.get("npcs", []).size(),
-		"target_count": d.get("target_npc_count", 0),
+
+func _clear_expired_events() -> void:
+	var now: float = Time.get_unix_time_from_system()
+	var to_end: Array = []
+	for eid in _events.keys():
+		var ev: Dictionary = _events[eid]
+		if float(ev["expires_at"]) <= now:
+			to_end.append(eid)
+	for eid in to_end:
+		var ev: Dictionary = _events[eid]
+		for nid in ev["npc_ids"]:
+			despawn(String(nid), "event_ended")
+		_events.erase(eid)
+		fomo_event_ended.emit(String(eid))
+
+
+# ── World time / weather ──────────────────────────────────────────────
+
+func set_world_time(hour: float) -> void:
+	_world_hour = fposmod(hour, 24.0)
+
+
+func set_weather(state: String) -> void:
+	_world_weather = state
+
+
+func is_night() -> bool:
+	return _world_hour < _DAWN_HOUR or _world_hour >= _DUSK_HOUR
+
+
+# ── Player registry (used for LOD + district demand + engage) ─────────
+
+func register_player(player_id: String, player_name: String, position: Vector3) -> void:
+	_players[player_id] = {
+		"player_id": player_id,
+		"name": player_name,
+		"position": position,
+		"district_id": _district_containing(position),
 	}
+	_refresh_district_demand()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: Occupation / Faction / Shop Selection
-# ─────────────────────────────────────────────────────────────────────────────
 
-func _pick_occupation_for_district(district_type: String) -> String:
-	var pool: Array = DISTRICT_OCCUPATIONS.get(district_type, ["civilian"])
-	return pool[randi() % pool.size()]
+func update_player_position(player_id: String, position: Vector3) -> void:
+	if not _players.has(player_id):
+		return
+	var rec: Dictionary = _players[player_id]
+	rec["position"] = position
+	rec["district_id"] = _district_containing(position)
+	_players[player_id] = rec
 
-func _pick_faction_for_district(district_type: String) -> String:
-	match district_type:
-		"corporate":   return "nexus_corp"
-		"underground": return "shadow_syndicate"
-		"industrial":  return "street_runners"
-		_:             return "civilian"
 
-func _pick_shop_type(occupation: String) -> String:
-	match occupation:
-		"merchant", "shopkeeper": return "general"
-		"street_vendor":          return "food"
-		"bartender":              return "food"
-		"smuggler", "shadow_dealer": return "black_market"
-		"fixer":                  return "general"
-		_:                        return "general"
+func unregister_player(player_id: String) -> void:
+	_players.erase(player_id)
+	_refresh_district_demand()
 
-func _pick_spawn_point(district: Dictionary) -> Vector3:
-	var points: Array = district.get("spawn_points", [])
-	if points.is_empty():
-		var center: Vector3 = district.get("center", Vector3.ZERO)
-		var radius: float = district.get("radius", 30.0)
-		var angle: float = randf() * PI * 2.0
-		var dist: float = randf_range(5.0, radius * 0.8)
-		return center + Vector3(cos(angle) * dist, 0, sin(angle) * dist)
-	return points[randi() % points.size()]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Utility
-# ─────────────────────────────────────────────────────────────────────────────
+func _district_containing(position: Vector3) -> String:
+	for id in _districts.keys():
+		var d: Dictionary = _districts[id]
+		var c: Vector3 = d.get("center", Vector3.ZERO)
+		var r: float = float(d.get("radius", 0.0))
+		if c.distance_to(position) <= r:
+			return String(id)
+	return ""
 
-func _generate_npc_id() -> String:
-	_npc_id_counter += 1
-	return "npc_" + str(_npc_id_counter).pad_zeros(5)
 
-func _try_load_npc_scene() -> void:
-	if ResourceLoader.exists(npc_scene_path):
-		_npc_scene = load(npc_scene_path)
-		_use_scene_instances = true
+func _refresh_district_demand() -> void:
+	var counts: Dictionary = {}
+	for pid in _players.keys():
+		var did: String = String(_players[pid].get("district_id", ""))
+		if did == "":
+			continue
+		counts[did] = int(counts.get(did, 0)) + 1
+	if _economy == null:
+		return
+	for id in _districts.keys():
+		_economy.set_district_player_count(String(id), int(counts.get(id, 0)))
+
+
+# ── Interaction ───────────────────────────────────────────────────────
+
+func player_interact_with_npc(npc_id: String, player_id: String, player_node = null, player_text: String = "") -> Dictionary:
+	if not _npcs.has(npc_id):
+		return {"ok": false, "reason": "no_such_npc"}
+	if not _players.has(player_id):
+		# Accept interaction even without registration, derive name from node.
+		var fallback_name: String = ""
+		if player_node != null and "name" in player_node:
+			fallback_name = String(player_node.name)
+		register_player(player_id, fallback_name, Vector3.ZERO)
+	var player_name: String = String(_players[player_id].get("name", player_id))
+	var dialogue = _npcs[npc_id]["dialogue"]
+	var out: Dictionary = dialogue.generate(player_id, player_name, player_text)
+	out["npc_id"] = npc_id
+	out["ok"] = true
+	npc_dialogue.emit(npc_id, player_id, String(out["text"]), String(out["topic"]))
+	return out
+
+
+func get_nearest_npc(position: Vector3, radius: float = 5.0) -> String:
+	var best: String = ""
+	var best_d: float = radius
+	for nid in _npcs.keys():
+		var brain = _npcs[nid]["brain"]
+		var d: float = brain.current_position.distance_to(position)
+		if d < best_d:
+			best_d = d
+			best = nid
+	return best
+
+
+func get_npcs_in_radius(position: Vector3, radius: float) -> Array:
+	var out: Array = []
+	for nid in _npcs.keys():
+		var brain = _npcs[nid]["brain"]
+		if brain.current_position.distance_to(position) <= radius:
+			out.append(nid)
+	return out
+
+
+# ── LOD evaluation ────────────────────────────────────────────────────
+
+func _compute_lod_for(npc_pos: Vector3) -> int:
+	if _players.is_empty():
+		return LOD_SCHEDULE
+	var nearest: float = INF
+	for pid in _players.keys():
+		var d: float = npc_pos.distance_to(_players[pid]["position"])
+		if d < nearest:
+			nearest = d
+	if nearest <= LOD_FULL_RADIUS:
+		return LOD_FULL
+	if nearest <= LOD_SIMPLE_RADIUS:
+		return LOD_SIMPLE
+	if nearest <= LOD_SCHEDULE_RADIUS:
+		return LOD_SCHEDULE
+	return LOD_OFFSCREEN
+
+
+func _rescan_lod() -> void:
+	var offscreen_ids: Array = []
+	for nid in _npcs.keys():
+		var rec: Dictionary = _npcs[nid]
+		var brain = rec["brain"]
+		var lod: int = _compute_lod_for(brain.current_position)
+		rec["lod"] = lod
+		if lod == LOD_OFFSCREEN:
+			# Permanent NPCs stay alive; event NPCs past their window die.
+			var kind: String = String(rec.get("spawn_kind", "permanent"))
+			var avatar = rec.get("avatar", null)
+			if avatar != null and is_instance_valid(avatar):
+				avatar.queue_free()
+				rec["avatar"] = null
+			if kind == "event":
+				if float(rec.get("expires_at", 0.0)) <= Time.get_unix_time_from_system():
+					offscreen_ids.append(nid)
+		else:
+			if enable_avatars and rec.get("avatar", null) == null:
+				rec["avatar"] = _spawn_avatar(brain.current_position)
+		_npcs[nid] = rec
+	for nid in offscreen_ids:
+		despawn(nid, "offscreen_expired")
+
+
+# ── AI tick ───────────────────────────────────────────────────────────
+
+func _process(delta: float) -> void:
+	# Advance in-game clock.
+	var hour_delta: float = delta * world_time_speed / 3600.0
+	var prev_hour: float = _world_hour
+	_world_hour = fposmod(_world_hour + hour_delta, 24.0)
+	if _world_hour < prev_hour:
+		_current_day += 1
+	_check_day_night_boundaries()
+	if _economy != null and _economy.has_method("set_world_is_night"):
+		_economy.set_world_is_night(is_night())
+
+	# LOD rescan periodically.
+	_lod_rescan_accum += delta
+	if _lod_rescan_accum >= LOD_RESCAN_SECS:
+		_lod_rescan_accum = 0.0
+		_rescan_lod()
+
+	# Mood ticks for all NPCs every frame (cheap).
+	for nid in _npcs.keys():
+		var rec: Dictionary = _npcs[nid]
+		var brain = rec["brain"]
+		brain.weather_state = _world_weather
+		brain.world_time_hour = _world_hour
+		brain.tick_mood(delta)
+
+	# Full LOD: 6 Hz decisions.
+	_tick_full_accum += delta
+	if _tick_full_accum >= 1.0 / TICK_FULL_HZ:
+		_tick_full_accum = 0.0
+		_tick_brains_at_lod(LOD_FULL, delta)
+
+	# Simple LOD: 2 Hz.
+	_tick_simple_accum += delta
+	if _tick_simple_accum >= 1.0 / TICK_SIMPLE_HZ:
+		_tick_simple_accum = 0.0
+		_tick_brains_at_lod(LOD_SIMPLE, delta)
+
+	# Schedule-only LOD: 0.5 Hz.
+	_tick_schedule_accum += delta
+	if _tick_schedule_accum >= 1.0 / TICK_SCHEDULE_HZ:
+		_tick_schedule_accum = 0.0
+		_tick_brains_at_lod(LOD_SCHEDULE, delta)
+
+	# Gossip exchange between nearby NPCs.
+	_gossip_accum += delta
+	if _gossip_accum >= GOSSIP_TICK_SECS:
+		_gossip_accum = 0.0
+		_tick_gossip()
+
+	# NPC-NPC economy trades.
+	_economy_accum += delta
+	if _economy_accum >= ECONOMY_TICK_SECS:
+		_economy_accum = 0.0
+		_tick_npc_economy()
+
+	# Expire any ended FOMO events.
+	_clear_expired_events()
+
+
+func _tick_brains_at_lod(lod: int, delta: float) -> void:
+	for nid in _npcs.keys():
+		var rec: Dictionary = _npcs[nid]
+		if int(rec["lod"]) != lod:
+			continue
+		var brain = rec["brain"]
+		var dialogue = rec["dialogue"]
+		dialogue.tick(delta)
+		# Build nearby player context only at FULL LOD (expensive).
+		var nearby: Array = []
+		if lod == LOD_FULL:
+			for pid in _players.keys():
+				var p: Dictionary = _players[pid]
+				if brain.current_position.distance_to(p["position"]) <= NPCBrain.ENGAGE_RADIUS_METERS:
+					nearby.append({
+						"player_id": pid,
+						"position": p["position"],
+					})
+		var action: Dictionary = brain.decide(_world_hour, nearby, {}, [])
+		_apply_action(nid, rec, action, lod)
+
+
+func _apply_action(nid: String, rec: Dictionary, action: Dictionary, lod: int) -> void:
+	var brain = rec["brain"]
+	var kind: String = String(action.get("action", NPCBrain.ACTION_IDLE))
+	match kind:
+		NPCBrain.ACTION_WANDER, NPCBrain.ACTION_GO_TO, NPCBrain.ACTION_FLEE, NPCBrain.ACTION_GUARD:
+			var target: Vector3 = action.get("target_position", brain.current_position)
+			_move_toward(brain, target, lod)
+		NPCBrain.ACTION_ENGAGE_PLAYER:
+			var pid: String = String(action.get("target_id", ""))
+			if pid != "" and _players.has(pid):
+				var line: Dictionary = rec["dialogue"].generate(pid, String(_players[pid].get("name", "")), "")
+				npc_dialogue.emit(nid, pid, String(line["text"]), String(line["topic"]))
+		NPCBrain.ACTION_SLEEP:
+			# Stay at home position.
+			_move_toward(brain, brain.home_position, lod)
+		_:
+			# idle / work / gossip / celebrate — keep brain in place but animate.
+			pass
+	rec["last_decision_at"] = Time.get_unix_time_from_system()
+	_npcs[nid] = rec
+
+
+func _move_toward(brain, target: Vector3, lod: int) -> void:
+	var step_speed: float = 2.5 if lod == LOD_FULL else (1.8 if lod == LOD_SIMPLE else 0.8)
+	# Approximate 1 decision-interval step.
+	var dt: float = (1.0 / TICK_FULL_HZ) if lod == LOD_FULL else ((1.0 / TICK_SIMPLE_HZ) if lod == LOD_SIMPLE else (1.0 / TICK_SCHEDULE_HZ))
+	var step: float = step_speed * dt
+	var to_target: Vector3 = target - brain.current_position
+	var dist: float = to_target.length()
+	if dist <= step:
+		brain.current_position = target
 	else:
-		_use_scene_instances = false
+		brain.current_position = brain.current_position + to_target.normalized() * step
 
-func _class_exists(class_name_str: String) -> bool:
-	return ClassDB.class_exists(class_name_str)
+
+# ── Gossip tick ───────────────────────────────────────────────────────
+
+func _tick_gossip() -> void:
+	var ids: Array = _npcs.keys()
+	for i in range(ids.size()):
+		var a: Dictionary = _npcs[ids[i]]
+		if int(a["lod"]) == LOD_OFFSCREEN:
+			continue
+		for j in range(i + 1, ids.size()):
+			var b: Dictionary = _npcs[ids[j]]
+			if int(b["lod"]) == LOD_OFFSCREEN:
+				continue
+			var da: float = a["brain"].current_position.distance_to(b["brain"].current_position)
+			if da > 8.0:
+				continue
+			# Pick a random player known to A, share with B.
+			var mem: Array = a["brain"].memory
+			if mem.is_empty():
+				continue
+			var e: Dictionary = mem[_rng.randi_range(0, mem.size() - 1)]
+			var pid: String = String(e.get("player_id", ""))
+			if pid == "":
+				continue
+			a["dialogue"].share_gossip_with_npc(pid, b["brain"], b["dialogue"])
+
+
+# ── NPC ↔ NPC economy tick ────────────────────────────────────────────
+
+func _tick_npc_economy() -> void:
+	if _economy == null or not _economy.has_method("initiate_npc_trade"):
+		return
+	# Find merchant-ish NPCs and pair nearby ones.
+	var merchants: Array = []
+	for nid in _npcs.keys():
+		var rec: Dictionary = _npcs[nid]
+		if int(rec["lod"]) == LOD_OFFSCREEN:
+			continue
+		if _economy.has_method("has_shop") and _economy.has_shop(nid):
+			merchants.append(nid)
+	for i in range(merchants.size()):
+		for j in range(i + 1, merchants.size()):
+			var a_id: String = String(merchants[i])
+			var b_id: String = String(merchants[j])
+			var a = _npcs[a_id]["brain"]
+			var b = _npcs[b_id]["brain"]
+			if a.current_position.distance_to(b.current_position) > 30.0:
+				continue
+			# Relationship = avg of both sides' faction relations + random jitter.
+			var rel: float = 0.0
+			rel += float(a.faction_relations.get(b.faction, 0.0))
+			rel += float(b.faction_relations.get(a.faction, 0.0))
+			rel = rel * 0.5 + _rng.randf_range(-0.15, 0.15)
+			_economy.initiate_npc_trade(a_id, b_id, rel)
+
+
+# ── Day/night cycle ───────────────────────────────────────────────────
+
+func _check_day_night_boundaries() -> void:
+	# Dawn: repopulate districts back up to at least min_npcs.
+	if _world_hour >= _DAWN_HOUR and _world_hour < _DAWN_HOUR + 0.5:
+		if _last_dawn_trigger_day != _current_day:
+			_last_dawn_trigger_day = _current_day
+			_dawn_repopulate()
+	# Dusk: despawn ~40% of NPCs (except underground).
+	if _world_hour >= _DUSK_HOUR and _world_hour < _DUSK_HOUR + 0.5:
+		if _last_dusk_trigger_day != _current_day:
+			_last_dusk_trigger_day = _current_day
+			_dusk_thin_out()
+
+
+func _dawn_repopulate() -> void:
+	for id in _districts.keys():
+		var d: Dictionary = _districts[id]
+		var min_n: int = int(d.get("min_npcs", 0))
+		var current: int = _count_npcs_in_district(String(id), "permanent")
+		if current < min_n:
+			spawn_in_district(String(id), min_n - current)
+
+
+func _dusk_thin_out() -> void:
+	for id in _districts.keys():
+		var d: Dictionary = _districts[id]
+		if String(d.get("type", "")) == "underground":
+			continue
+		var ids_here: Array = []
+		for nid in _npcs.keys():
+			var rec: Dictionary = _npcs[nid]
+			if String(rec["district_id"]) == String(id) and String(rec["spawn_kind"]) == "permanent":
+				ids_here.append(nid)
+		# Shuffle and despawn the configured dusk ratio.
+		ids_here.shuffle()
+		var cull: int = int(round(float(ids_here.size()) * _DUSK_DESPAWN_RATIO))
+		for i in range(cull):
+			despawn(String(ids_here[i]), "dusk")
+
+
+func _count_npcs_in_district(district_id: String, kind: String = "") -> int:
+	var n: int = 0
+	for nid in _npcs.keys():
+		var rec: Dictionary = _npcs[nid]
+		if String(rec["district_id"]) != district_id:
+			continue
+		if kind != "" and String(rec["spawn_kind"]) != kind:
+			continue
+		n += 1
+	return n
+
+
+# ── Debug / inspection ────────────────────────────────────────────────
+
+func describe_npc(npc_id: String) -> Dictionary:
+	if not _npcs.has(npc_id):
+		return {}
+	var rec: Dictionary = _npcs[npc_id]
+	var s: Dictionary = rec["brain"].snapshot()
+	s["lod"] = int(rec["lod"])
+	s["spawn_kind"] = rec["spawn_kind"]
+	s["district_id"] = rec["district_id"]
+	return s
+
+
+func summary() -> Dictionary:
+	var by_district: Dictionary = {}
+	var by_lod: Dictionary = {0: 0, 1: 0, 2: 0, 3: 0}
+	for nid in _npcs.keys():
+		var rec: Dictionary = _npcs[nid]
+		var did: String = String(rec["district_id"])
+		by_district[did] = int(by_district.get(did, 0)) + 1
+		by_lod[int(rec["lod"])] = int(by_lod.get(int(rec["lod"]), 0)) + 1
+	return {
+		"npcs": _npcs.size(),
+		"districts": by_district,
+		"by_lod": by_lod,
+		"events": _events.size(),
+		"hour": _world_hour,
+		"weather": _world_weather,
+		"players": _players.size(),
+	}
