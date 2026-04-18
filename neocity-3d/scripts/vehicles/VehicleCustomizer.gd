@@ -1,745 +1,901 @@
-## VehicleCustomizer — Paint, Decals, Wheels, Body Kits, Underglow
-## Handles all cosmetic customisation of vehicles in real-time 3D.
-
+## VehicleCustomizer
+## -----------------------------------------------------------------------------
+## Runtime customization stack for Neo City player vehicles.
+##
+## Responsibilities:
+##   * Body paint with ShaderMaterial (metallic, matte, chrome, pearlescent)
+##   * Decal application (50+ templates) projected onto body via Decal nodes
+##   * Wheels (20 styles), spoilers (10 styles), exhausts (5 styles)
+##   * Underglow lighting (HSV/RGB neon) with flicker/pulse patterns
+##   * Save / load customization configurations to the player profile
+##   * Snapshot exports to the marketplace and garage preview
+##
+## The customizer operates on a VehicleBody3D (or any Node3D) that exposes the
+## following optional child paths:
+##   BodyMesh            : MeshInstance3D   (main body)
+##   WheelMesh_{0..3}    : MeshInstance3D   (four corners)
+##   SpoilerMount        : Node3D           (attachment anchor)
+##   ExhaustMount        : Node3D           (attachment anchor)
+##   UnderglowAnchor     : Node3D           (under chassis)
+##
+## Any missing child is tolerated; the customizer logs a warning and skips that
+## slot. This keeps the class usable inside editor previews and headless tests.
 extends Node
+class_name VehicleCustomizer
 
-# ---------------------------------------------------------------------------
-# Signals
-# ---------------------------------------------------------------------------
-signal customization_applied(config: Dictionary)
-signal config_saved(config_id: String)
-signal config_loaded(config: Dictionary)
-signal decal_changed(decal_id: int)
+## -----------------------------------------------------------------------------
+## Signals
+## -----------------------------------------------------------------------------
 signal paint_changed(color: Color, finish: String)
-signal wheel_style_changed(style_id: int)
-signal underglow_changed(color: Color, enabled: bool)
+signal decal_applied(decal_id: String, slot: int)
+signal decal_removed(slot: int)
+signal wheels_changed(wheel_id: String)
+signal spoiler_changed(spoiler_id: String)
+signal exhaust_changed(exhaust_id: String)
+signal underglow_changed(color: Color, pattern: String)
+signal configuration_loaded(config_name: String)
+signal configuration_saved(config_name: String)
+signal snapshot_captured(image: Image)
 
-# ---------------------------------------------------------------------------
-# Constants — paint finishes
-# ---------------------------------------------------------------------------
-const FINISH_METALLIC    := "metallic"
-const FINISH_MATTE       := "matte"
-const FINISH_CHROME      := "chrome"
-const FINISH_PEARLESCENT := "pearlescent"
-const FINISH_CANDY       := "candy"
-const FINISH_SATIN       := "satin"
+## -----------------------------------------------------------------------------
+## Constants — Finishes
+## -----------------------------------------------------------------------------
+const FINISH_METALLIC: String = "metallic"
+const FINISH_MATTE: String = "matte"
+const FINISH_CHROME: String = "chrome"
+const FINISH_PEARLESCENT: String = "pearlescent"
 
-const ALL_FINISHES := [
+const ALL_FINISHES: Array[String] = [
 	FINISH_METALLIC,
 	FINISH_MATTE,
 	FINISH_CHROME,
 	FINISH_PEARLESCENT,
-	FINISH_CANDY,
-	FINISH_SATIN,
 ]
 
-# Decal template library (50+ entries)
-const DECAL_TEMPLATES: Array[Dictionary] = [
-	{"id": 0,  "name": "None",            "texture": ""},
-	{"id": 1,  "name": "Flames Classic",  "texture": "res://materials/decals/flames_classic.png"},
-	{"id": 2,  "name": "Flames Modern",   "texture": "res://materials/decals/flames_modern.png"},
-	{"id": 3,  "name": "Racing Stripes",  "texture": "res://materials/decals/racing_stripes.png"},
-	{"id": 4,  "name": "Tribal",          "texture": "res://materials/decals/tribal.png"},
-	{"id": 5,  "name": "Stars",           "texture": "res://materials/decals/stars.png"},
-	{"id": 6,  "name": "Skulls",          "texture": "res://materials/decals/skulls.png"},
-	{"id": 7,  "name": "Dragon",          "texture": "res://materials/decals/dragon.png"},
-	{"id": 8,  "name": "Eagle",           "texture": "res://materials/decals/eagle.png"},
-	{"id": 9,  "name": "Cyber Grid",      "texture": "res://materials/decals/cyber_grid.png"},
-	{"id": 10, "name": "Neon Lines",      "texture": "res://materials/decals/neon_lines.png"},
-	{"id": 11, "name": "Circuit Board",   "texture": "res://materials/decals/circuit_board.png"},
-	{"id": 12, "name": "Pixel Camo",      "texture": "res://materials/decals/pixel_camo.png"},
-	{"id": 13, "name": "Urban Camo",      "texture": "res://materials/decals/urban_camo.png"},
-	{"id": 14, "name": "Desert Camo",     "texture": "res://materials/decals/desert_camo.png"},
-	{"id": 15, "name": "Arctic Camo",     "texture": "res://materials/decals/arctic_camo.png"},
-	{"id": 16, "name": "Checker",         "texture": "res://materials/decals/checker.png"},
-	{"id": 17, "name": "Checker Bold",    "texture": "res://materials/decals/checker_bold.png"},
-	{"id": 18, "name": "Crosshatch",      "texture": "res://materials/decals/crosshatch.png"},
-	{"id": 19, "name": "Honeycomb",       "texture": "res://materials/decals/honeycomb.png"},
-	{"id": 20, "name": "Hexagons",        "texture": "res://materials/decals/hexagons.png"},
-	{"id": 21, "name": "Waves",           "texture": "res://materials/decals/waves.png"},
-	{"id": 22, "name": "Lightning",       "texture": "res://materials/decals/lightning.png"},
-	{"id": 23, "name": "Splatter",        "texture": "res://materials/decals/splatter.png"},
-	{"id": 24, "name": "Graffiti Tag",    "texture": "res://materials/decals/graffiti_tag.png"},
-	{"id": 25, "name": "Dragon II",       "texture": "res://materials/decals/dragon2.png"},
-	{"id": 26, "name": "Koi Fish",        "texture": "res://materials/decals/koi.png"},
-	{"id": 27, "name": "Phoenix",         "texture": "res://materials/decals/phoenix.png"},
-	{"id": 28, "name": "Rose",            "texture": "res://materials/decals/rose.png"},
-	{"id": 29, "name": "Thorns",          "texture": "res://materials/decals/thorns.png"},
-	{"id": 30, "name": "Mandala",         "texture": "res://materials/decals/mandala.png"},
-	{"id": 31, "name": "Geometric",       "texture": "res://materials/decals/geometric.png"},
-	{"id": 32, "name": "Abstract Brush",  "texture": "res://materials/decals/abstract_brush.png"},
-	{"id": 33, "name": "Kanji Speed",     "texture": "res://materials/decals/kanji_speed.png"},
-	{"id": 34, "name": "Kanji Power",     "texture": "res://materials/decals/kanji_power.png"},
-	{"id": 35, "name": "Flag USA",        "texture": "res://materials/decals/flag_usa.png"},
-	{"id": 36, "name": "Flag Japan",      "texture": "res://materials/decals/flag_japan.png"},
-	{"id": 37, "name": "Flag UK",         "texture": "res://materials/decals/flag_uk.png"},
-	{"id": 38, "name": "Skull Candy",     "texture": "res://materials/decals/skull_candy.png"},
-	{"id": 39, "name": "Retro Racer",     "texture": "res://materials/decals/retro_racer.png"},
-	{"id": 40, "name": "Neon Glow",       "texture": "res://materials/decals/neon_glow.png"},
-	{"id": 41, "name": "Holographic",     "texture": "res://materials/decals/holographic.png"},
-	{"id": 42, "name": "Bio Hazard",      "texture": "res://materials/decals/biohazard.png"},
-	{"id": 43, "name": "Radioactive",     "texture": "res://materials/decals/radioactive.png"},
-	{"id": 44, "name": "Crypto Runes",    "texture": "res://materials/decals/crypto_runes.png"},
-	{"id": 45, "name": "Ghost Lines",     "texture": "res://materials/decals/ghost_lines.png"},
-	{"id": 46, "name": "Ice Crystal",     "texture": "res://materials/decals/ice_crystal.png"},
-	{"id": 47, "name": "Lava Flow",       "texture": "res://materials/decals/lava_flow.png"},
-	{"id": 48, "name": "Deep Sea",        "texture": "res://materials/decals/deep_sea.png"},
-	{"id": 49, "name": "Nebula",          "texture": "res://materials/decals/nebula.png"},
-	{"id": 50, "name": "Galaxy Swirl",    "texture": "res://materials/decals/galaxy_swirl.png"},
-]
-
-# Wheel style library (20 entries)
-const WHEEL_STYLES: Array[Dictionary] = [
-	{"id": 0,  "name": "Stock Steel",     "mesh": "res://materials/wheels/stock_steel.tres"},
-	{"id": 1,  "name": "Sport Alloy",     "mesh": "res://materials/wheels/sport_alloy.tres"},
-	{"id": 2,  "name": "Deep Dish",       "mesh": "res://materials/wheels/deep_dish.tres"},
-	{"id": 3,  "name": "Spokes Classic",  "mesh": "res://materials/wheels/spokes_classic.tres"},
-	{"id": 4,  "name": "Spokes Thin",     "mesh": "res://materials/wheels/spokes_thin.tres"},
-	{"id": 5,  "name": "Turbine",         "mesh": "res://materials/wheels/turbine.tres"},
-	{"id": 6,  "name": "Star Spoke",      "mesh": "res://materials/wheels/star_spoke.tres"},
-	{"id": 7,  "name": "Mesh",            "mesh": "res://materials/wheels/mesh_wheel.tres"},
-	{"id": 8,  "name": "Blade",           "mesh": "res://materials/wheels/blade.tres"},
-	{"id": 9,  "name": "Aero",            "mesh": "res://materials/wheels/aero.tres"},
-	{"id": 10, "name": "Split 5",         "mesh": "res://materials/wheels/split5.tres"},
-	{"id": 11, "name": "Split 10",        "mesh": "res://materials/wheels/split10.tres"},
-	{"id": 12, "name": "Forged Mono",     "mesh": "res://materials/wheels/forged_mono.tres"},
-	{"id": 13, "name": "Chrome Bullet",   "mesh": "res://materials/wheels/chrome_bullet.tres"},
-	{"id": 14, "name": "Cyber Spoke",     "mesh": "res://materials/wheels/cyber_spoke.tres"},
-	{"id": 15, "name": "Neon Ring",       "mesh": "res://materials/wheels/neon_ring.tres"},
-	{"id": 16, "name": "Carbon Centre",   "mesh": "res://materials/wheels/carbon_centre.tres"},
-	{"id": 17, "name": "Stealth",         "mesh": "res://materials/wheels/stealth.tres"},
-	{"id": 18, "name": "Gold Floater",    "mesh": "res://materials/wheels/gold_floater.tres"},
-	{"id": 19, "name": "Hologram Rim",    "mesh": "res://materials/wheels/hologram_rim.tres"},
-]
-
-# Spoiler styles (10 entries)
-const SPOILER_STYLES: Array[Dictionary] = [
-	{"id": 0, "name": "None",           "mesh": ""},
-	{"id": 1, "name": "Ducktail",       "mesh": "res://materials/spoilers/ducktail.tres"},
-	{"id": 2, "name": "GT Wing",        "mesh": "res://materials/spoilers/gt_wing.tres"},
-	{"id": 3, "name": "Whale Tail",     "mesh": "res://materials/spoilers/whale_tail.tres"},
-	{"id": 4, "name": "Low Profile",    "mesh": "res://materials/spoilers/low_profile.tres"},
-	{"id": 5, "name": "Carbon Blade",   "mesh": "res://materials/spoilers/carbon_blade.tres"},
-	{"id": 6, "name": "Infinity Wing",  "mesh": "res://materials/spoilers/infinity_wing.tres"},
-	{"id": 7, "name": "Rally Fin",      "mesh": "res://materials/spoilers/rally_fin.tres"},
-	{"id": 8, "name": "Neon Foil",      "mesh": "res://materials/spoilers/neon_foil.tres"},
-	{"id": 9, "name": "Cyber Delta",    "mesh": "res://materials/spoilers/cyber_delta.tres"},
-]
-
-# Exhaust styles (5 entries)
-const EXHAUST_STYLES: Array[Dictionary] = [
-	{"id": 0, "name": "Stock",          "mesh": ""},
-	{"id": 1, "name": "Dual Round",     "mesh": "res://materials/exhausts/dual_round.tres"},
-	{"id": 2, "name": "Quad Sport",     "mesh": "res://materials/exhausts/quad_sport.tres"},
-	{"id": 3, "name": "Hex Cluster",    "mesh": "res://materials/exhausts/hex_cluster.tres"},
-	{"id": 4, "name": "Side Exit",      "mesh": "res://materials/exhausts/side_exit.tres"},
-]
-
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
-var vehicle_node: Node3D = null
-var body_mesh: MeshInstance3D = null
-var decal_nodes: Array[Decal] = []
-var wheel_mesh_instances: Array[MeshInstance3D] = []
-var spoiler_mesh: MeshInstance3D = null
-var exhaust_mesh: MeshInstance3D = null
-var underglow_lights: Array[OmniLight3D] = []
-
-var current_config: Dictionary = {
-	"paint_color":   Color(0.1, 0.5, 1.0),
-	"paint_finish":  FINISH_METALLIC,
-	"secondary_color": Color(0.05, 0.05, 0.05),
-	"decal_id":      0,
-	"decal_color":   Color(1, 1, 1),
-	"decal_opacity": 1.0,
-	"wheel_id":      0,
-	"wheel_color":   Color(0.8, 0.8, 0.8),
-	"spoiler_id":    0,
-	"exhaust_id":    0,
-	"underglow_enabled": false,
-	"underglow_color":   Color(0, 1, 1),
-	"underglow_intensity": 2.0,
-	"tint_opacity":  0.0,
-	"tint_color":    Color(0, 0, 0),
-	"license_plate": "QUANT01",
+## -----------------------------------------------------------------------------
+## Constants — Decal Catalogue (50+ templates)
+## -----------------------------------------------------------------------------
+## Decals are keyed by ID. Each entry carries a human-readable name, a category,
+## a rarity tier, a price in Quant tokens, and a texture path that callers may
+## resolve via ResourceLoader.
+const DECAL_CATALOGUE: Dictionary = {
+	"flame_classic":       {"name": "Classic Flame",         "category": "Flames",    "rarity": "common",    "price": 150,  "path": "res://materials/decals/flame_classic.png"},
+	"flame_blue":          {"name": "Blue Inferno",          "category": "Flames",    "rarity": "uncommon",  "price": 300,  "path": "res://materials/decals/flame_blue.png"},
+	"flame_cyber":         {"name": "Cyber Plasma",          "category": "Flames",    "rarity": "rare",      "price": 750,  "path": "res://materials/decals/flame_cyber.png"},
+	"flame_skull":         {"name": "Skull & Flame",         "category": "Flames",    "rarity": "uncommon",  "price": 450,  "path": "res://materials/decals/flame_skull.png"},
+	"stripe_racing":       {"name": "Racing Stripes",        "category": "Stripes",   "rarity": "common",    "price": 100,  "path": "res://materials/decals/stripe_racing.png"},
+	"stripe_dual":         {"name": "Dual Stripe",           "category": "Stripes",   "rarity": "common",    "price": 120,  "path": "res://materials/decals/stripe_dual.png"},
+	"stripe_ghost":        {"name": "Ghost Stripe",          "category": "Stripes",   "rarity": "uncommon",  "price": 250,  "path": "res://materials/decals/stripe_ghost.png"},
+	"stripe_lightning":    {"name": "Lightning Stripe",      "category": "Stripes",   "rarity": "rare",      "price": 600,  "path": "res://materials/decals/stripe_lightning.png"},
+	"tribal_left":         {"name": "Tribal Left Side",      "category": "Tribal",    "rarity": "common",    "price": 180,  "path": "res://materials/decals/tribal_left.png"},
+	"tribal_right":        {"name": "Tribal Right Side",     "category": "Tribal",    "rarity": "common",    "price": 180,  "path": "res://materials/decals/tribal_right.png"},
+	"tribal_wing":         {"name": "Tribal Wings",          "category": "Tribal",    "rarity": "uncommon",  "price": 320,  "path": "res://materials/decals/tribal_wing.png"},
+	"tribal_dragon":       {"name": "Tribal Dragon",         "category": "Tribal",    "rarity": "rare",      "price": 800,  "path": "res://materials/decals/tribal_dragon.png"},
+	"faction_reapers":     {"name": "Reapers Crest",         "category": "Factions",  "rarity": "rare",      "price": 900,  "path": "res://materials/decals/faction_reapers.png"},
+	"faction_ghosts":      {"name": "Ghosts Insignia",       "category": "Factions",  "rarity": "rare",      "price": 900,  "path": "res://materials/decals/faction_ghosts.png"},
+	"faction_syndicate":   {"name": "Syndicate Seal",        "category": "Factions",  "rarity": "rare",      "price": 900,  "path": "res://materials/decals/faction_syndicate.png"},
+	"faction_neonkings":   {"name": "Neon Kings Crown",      "category": "Factions",  "rarity": "epic",      "price": 1500, "path": "res://materials/decals/faction_neonkings.png"},
+	"kanji_speed":         {"name": "Kanji — Speed",         "category": "Kanji",     "rarity": "common",    "price": 140,  "path": "res://materials/decals/kanji_speed.png"},
+	"kanji_power":         {"name": "Kanji — Power",         "category": "Kanji",     "rarity": "common",    "price": 140,  "path": "res://materials/decals/kanji_power.png"},
+	"kanji_dragon":        {"name": "Kanji — Dragon",        "category": "Kanji",     "rarity": "uncommon",  "price": 280,  "path": "res://materials/decals/kanji_dragon.png"},
+	"kanji_thunder":       {"name": "Kanji — Thunder",       "category": "Kanji",     "rarity": "uncommon",  "price": 280,  "path": "res://materials/decals/kanji_thunder.png"},
+	"number_00":           {"name": "Race Number 00",        "category": "Numbers",   "rarity": "common",    "price": 80,   "path": "res://materials/decals/number_00.png"},
+	"number_07":           {"name": "Race Number 07",        "category": "Numbers",   "rarity": "common",    "price": 80,   "path": "res://materials/decals/number_07.png"},
+	"number_13":           {"name": "Race Number 13",        "category": "Numbers",   "rarity": "common",    "price": 80,   "path": "res://materials/decals/number_13.png"},
+	"number_42":           {"name": "Race Number 42",        "category": "Numbers",   "rarity": "common",    "price": 80,   "path": "res://materials/decals/number_42.png"},
+	"number_69":           {"name": "Race Number 69",        "category": "Numbers",   "rarity": "uncommon",  "price": 160,  "path": "res://materials/decals/number_69.png"},
+	"number_99":           {"name": "Race Number 99",        "category": "Numbers",   "rarity": "common",    "price": 80,   "path": "res://materials/decals/number_99.png"},
+	"sponsor_quantads":    {"name": "Sponsor — QuantAds",    "category": "Sponsors",  "rarity": "uncommon",  "price": 0,    "path": "res://materials/decals/sponsor_quantads.png"},
+	"sponsor_neofuel":     {"name": "Sponsor — NeoFuel",     "category": "Sponsors",  "rarity": "uncommon",  "price": 0,    "path": "res://materials/decals/sponsor_neofuel.png"},
+	"sponsor_chromecola":  {"name": "Sponsor — ChromeCola",  "category": "Sponsors",  "rarity": "uncommon",  "price": 0,    "path": "res://materials/decals/sponsor_chromecola.png"},
+	"sponsor_nightlife":   {"name": "Sponsor — Nightlife",   "category": "Sponsors",  "rarity": "uncommon",  "price": 0,    "path": "res://materials/decals/sponsor_nightlife.png"},
+	"circuit_blue":        {"name": "Circuit Board — Blue",  "category": "Tech",      "rarity": "rare",      "price": 700,  "path": "res://materials/decals/circuit_blue.png"},
+	"circuit_green":       {"name": "Circuit Board — Green", "category": "Tech",      "rarity": "rare",      "price": 700,  "path": "res://materials/decals/circuit_green.png"},
+	"glitch_art":          {"name": "Glitch Art",            "category": "Tech",      "rarity": "epic",      "price": 1400, "path": "res://materials/decals/glitch_art.png"},
+	"hologram_grid":       {"name": "Hologram Grid",         "category": "Tech",      "rarity": "epic",      "price": 1600, "path": "res://materials/decals/hologram_grid.png"},
+	"wireframe":           {"name": "Wireframe",             "category": "Tech",      "rarity": "rare",      "price": 650,  "path": "res://materials/decals/wireframe.png"},
+	"graffiti_tag":        {"name": "Graffiti Tag",          "category": "Street",    "rarity": "common",    "price": 120,  "path": "res://materials/decals/graffiti_tag.png"},
+	"graffiti_throw":      {"name": "Graffiti Throwie",      "category": "Street",    "rarity": "common",    "price": 150,  "path": "res://materials/decals/graffiti_throw.png"},
+	"graffiti_piece":      {"name": "Graffiti Piece",        "category": "Street",    "rarity": "uncommon",  "price": 380,  "path": "res://materials/decals/graffiti_piece.png"},
+	"graffiti_wildstyle":  {"name": "Graffiti Wildstyle",    "category": "Street",    "rarity": "rare",      "price": 720,  "path": "res://materials/decals/graffiti_wildstyle.png"},
+	"anime_hero":          {"name": "Anime Hero",            "category": "Anime",     "rarity": "rare",      "price": 900,  "path": "res://materials/decals/anime_hero.png"},
+	"anime_samurai":       {"name": "Anime Samurai",         "category": "Anime",     "rarity": "rare",      "price": 900,  "path": "res://materials/decals/anime_samurai.png"},
+	"anime_mecha":         {"name": "Anime Mecha",           "category": "Anime",     "rarity": "epic",      "price": 1800, "path": "res://materials/decals/anime_mecha.png"},
+	"retro_sunset":        {"name": "Retro Sunset",          "category": "Retro",     "rarity": "uncommon",  "price": 340,  "path": "res://materials/decals/retro_sunset.png"},
+	"retro_palm":          {"name": "Retro Palm",            "category": "Retro",     "rarity": "uncommon",  "price": 300,  "path": "res://materials/decals/retro_palm.png"},
+	"retro_neon_wave":     {"name": "Retro Neon Wave",       "category": "Retro",     "rarity": "rare",      "price": 760,  "path": "res://materials/decals/retro_neon_wave.png"},
+	"skull_chrome":        {"name": "Chrome Skull",          "category": "Skulls",    "rarity": "uncommon",  "price": 420,  "path": "res://materials/decals/skull_chrome.png"},
+	"skull_cyber":         {"name": "Cyber Skull",           "category": "Skulls",    "rarity": "rare",      "price": 820,  "path": "res://materials/decals/skull_cyber.png"},
+	"skull_ghost":         {"name": "Ghost Skull",           "category": "Skulls",    "rarity": "rare",      "price": 860,  "path": "res://materials/decals/skull_ghost.png"},
+	"phoenix_rising":      {"name": "Phoenix Rising",        "category": "Mythic",    "rarity": "epic",      "price": 1900, "path": "res://materials/decals/phoenix_rising.png"},
+	"dragon_serpent":      {"name": "Dragon Serpent",        "category": "Mythic",    "rarity": "epic",      "price": 1950, "path": "res://materials/decals/dragon_serpent.png"},
+	"koi_fish":            {"name": "Koi Fish",              "category": "Mythic",    "rarity": "rare",      "price": 780,  "path": "res://materials/decals/koi_fish.png"},
+	"galaxy_spiral":       {"name": "Galaxy Spiral",         "category": "Cosmic",    "rarity": "epic",      "price": 1700, "path": "res://materials/decals/galaxy_spiral.png"},
+	"nebula_dust":         {"name": "Nebula Dust",           "category": "Cosmic",    "rarity": "rare",      "price": 690,  "path": "res://materials/decals/nebula_dust.png"},
+	"qr_mystery":          {"name": "QR Mystery Box",        "category": "Meta",      "rarity": "legendary", "price": 3000, "path": "res://materials/decals/qr_mystery.png"},
 }
+
+## Number of decal slots supported per vehicle. Slots are positioned in a ring
+## around the body mesh by _get_decal_transform_for_slot().
+const DECAL_SLOT_COUNT: int = 6
+
+## -----------------------------------------------------------------------------
+## Constants — Wheel Catalogue (20 styles)
+## -----------------------------------------------------------------------------
+const WHEEL_CATALOGUE: Dictionary = {
+	"stock_5spoke":      {"name": "Stock 5-Spoke",      "price": 0,    "rarity": "common",    "rim_color": Color(0.6, 0.6, 0.6), "glow": false},
+	"stock_7spoke":      {"name": "Stock 7-Spoke",      "price": 0,    "rarity": "common",    "rim_color": Color(0.55, 0.55, 0.55), "glow": false},
+	"sport_deepdish":    {"name": "Sport Deep-Dish",    "price": 450,  "rarity": "common",    "rim_color": Color(0.2, 0.2, 0.2), "glow": false},
+	"sport_mesh":        {"name": "Sport Mesh",         "price": 500,  "rarity": "common",    "rim_color": Color(0.3, 0.3, 0.3), "glow": false},
+	"sport_turbofan":    {"name": "Sport Turbofan",     "price": 620,  "rarity": "uncommon",  "rim_color": Color(0.4, 0.4, 0.4), "glow": false},
+	"race_splitspoke":   {"name": "Race Split-Spoke",   "price": 800,  "rarity": "uncommon",  "rim_color": Color(0.1, 0.1, 0.1), "glow": false},
+	"race_monoblock":    {"name": "Race Monoblock",     "price": 950,  "rarity": "uncommon",  "rim_color": Color(0.15, 0.15, 0.15), "glow": false},
+	"race_concave":      {"name": "Race Concave",       "price": 1100, "rarity": "rare",      "rim_color": Color(0.05, 0.05, 0.05), "glow": false},
+	"chrome_classic":    {"name": "Chrome Classic",     "price": 1200, "rarity": "rare",      "rim_color": Color(0.9, 0.9, 0.9), "glow": false},
+	"chrome_star":       {"name": "Chrome Star",        "price": 1350, "rarity": "rare",      "rim_color": Color(0.95, 0.95, 0.95), "glow": false},
+	"bronze_forged":     {"name": "Bronze Forged",      "price": 1100, "rarity": "rare",      "rim_color": Color(0.7, 0.45, 0.2), "glow": false},
+	"gold_luxe":         {"name": "Gold Luxe",          "price": 1800, "rarity": "epic",      "rim_color": Color(1.0, 0.82, 0.2), "glow": false},
+	"neon_blue":         {"name": "Neon Blue Runners",  "price": 1600, "rarity": "epic",      "rim_color": Color(0.2, 0.5, 1.0), "glow": true},
+	"neon_pink":         {"name": "Neon Pink Runners",  "price": 1600, "rarity": "epic",      "rim_color": Color(1.0, 0.25, 0.7), "glow": true},
+	"neon_green":        {"name": "Neon Green Runners", "price": 1600, "rarity": "epic",      "rim_color": Color(0.3, 1.0, 0.4), "glow": true},
+	"holo_shift":        {"name": "Holographic Shift",  "price": 2400, "rarity": "legendary", "rim_color": Color(0.8, 0.9, 1.0), "glow": true},
+	"offroad_beadlock":  {"name": "Off-Road Beadlock",  "price": 780,  "rarity": "uncommon",  "rim_color": Color(0.25, 0.25, 0.25), "glow": false},
+	"drift_spoke":       {"name": "Drift Spoke",        "price": 900,  "rarity": "uncommon",  "rim_color": Color(0.2, 0.2, 0.2), "glow": false},
+	"jdm_tuner":         {"name": "JDM Tuner",          "price": 1050, "rarity": "rare",      "rim_color": Color(0.15, 0.15, 0.15), "glow": false},
+	"quantum_vortex":    {"name": "Quantum Vortex",     "price": 3200, "rarity": "legendary", "rim_color": Color(0.6, 0.2, 1.0), "glow": true},
+}
+
+## -----------------------------------------------------------------------------
+## Constants — Spoiler Catalogue (10 styles)
+## -----------------------------------------------------------------------------
+const SPOILER_CATALOGUE: Dictionary = {
+	"none":           {"name": "None",            "price": 0,    "rarity": "common",    "downforce": 0.0,  "drag": 0.0},
+	"lip":            {"name": "Lip Spoiler",     "price": 180,  "rarity": "common",    "downforce": 0.05, "drag": 0.01},
+	"ducktail":       {"name": "Ducktail",        "price": 280,  "rarity": "common",    "downforce": 0.08, "drag": 0.02},
+	"bootlid":        {"name": "Bootlid Wing",    "price": 380,  "rarity": "uncommon",  "downforce": 0.12, "drag": 0.03},
+	"gt_low":         {"name": "GT Low Wing",     "price": 520,  "rarity": "uncommon",  "downforce": 0.18, "drag": 0.05},
+	"gt_high":        {"name": "GT High Wing",    "price": 780,  "rarity": "rare",      "downforce": 0.28, "drag": 0.08},
+	"swan_neck":      {"name": "Swan Neck Wing",  "price": 1100, "rarity": "rare",      "downforce": 0.36, "drag": 0.10},
+	"active_aero":    {"name": "Active Aero",     "price": 1900, "rarity": "epic",      "downforce": 0.45, "drag": 0.06},
+	"le_mans":        {"name": "Le Mans Wing",    "price": 2600, "rarity": "epic",      "downforce": 0.60, "drag": 0.14},
+	"quantum_fin":    {"name": "Quantum Fin",     "price": 3800, "rarity": "legendary", "downforce": 0.80, "drag": 0.09},
+}
+
+## -----------------------------------------------------------------------------
+## Constants — Exhaust Catalogue (5 styles)
+## -----------------------------------------------------------------------------
+const EXHAUST_CATALOGUE: Dictionary = {
+	"stock":           {"name": "Stock",            "price": 0,    "rarity": "common",    "tip_count": 1, "tone": "soft",   "db": 78},
+	"sport_single":    {"name": "Sport Single",     "price": 320,  "rarity": "common",    "tip_count": 1, "tone": "mid",    "db": 88},
+	"sport_dual":      {"name": "Sport Dual",       "price": 560,  "rarity": "uncommon",  "tip_count": 2, "tone": "mid",    "db": 92},
+	"race_quad":       {"name": "Race Quad",        "price": 1200, "rarity": "rare",      "tip_count": 4, "tone": "sharp",  "db": 101},
+	"quantum_ion":     {"name": "Quantum Ion Jet",  "price": 2900, "rarity": "legendary", "tip_count": 2, "tone": "hyper",  "db": 115},
+}
+
+## -----------------------------------------------------------------------------
+## Constants — Underglow Patterns
+## -----------------------------------------------------------------------------
+const UNDERGLOW_PATTERNS: Array[String] = [
+	"solid",
+	"pulse",
+	"strobe",
+	"chase",
+	"rainbow",
+	"off",
+]
+
+## -----------------------------------------------------------------------------
+## Constants — Misc
+## -----------------------------------------------------------------------------
+const CONFIG_FILE_PATH: String = "user://vehicle_configs.json"
+const SNAPSHOT_SIZE: Vector2i = Vector2i(512, 512)
+const DEFAULT_PAINT_COLOR: Color = Color(0.85, 0.12, 0.14)
+
+## -----------------------------------------------------------------------------
+## Exported fields
+## -----------------------------------------------------------------------------
+@export_node_path("Node3D") var target_vehicle_path: NodePath
+@export var auto_apply_on_ready: bool = true
+@export var profile_user_id: String = "local_user"
+
+## -----------------------------------------------------------------------------
+## Runtime state — canonical configuration
+## -----------------------------------------------------------------------------
+var paint_color: Color = DEFAULT_PAINT_COLOR
+var paint_finish: String = FINISH_METALLIC
+var paint_metallic: float = 0.85
+var paint_roughness: float = 0.25
+var paint_clearcoat: float = 0.5
+var paint_pearl_shift: Color = Color(0.2, 0.4, 1.0)
+
+var active_decals: Dictionary = {}   # slot:int -> decal_id:String
+var wheels_id: String = "stock_5spoke"
+var spoiler_id: String = "none"
+var exhaust_id: String = "stock"
+var underglow_color: Color = Color(0.1, 0.6, 1.0)
+var underglow_pattern: String = "off"
+var underglow_intensity: float = 1.0
+
+## -----------------------------------------------------------------------------
+## Runtime state — scene references
+## -----------------------------------------------------------------------------
+var _vehicle: Node3D = null
+var _body_mesh: MeshInstance3D = null
+var _wheel_meshes: Array = []
+var _spoiler_mount: Node3D = null
+var _exhaust_mount: Node3D = null
+var _underglow_anchor: Node3D = null
 
 var _paint_material: ShaderMaterial = null
-var _saved_configs: Dictionary = {}
-var _undo_stack: Array[Dictionary] = []
-var _redo_stack: Array[Dictionary] = []
-const MAX_UNDO := 20
+var _decal_nodes: Dictionary = {}     # slot:int -> Decal
+var _spoiler_instance: Node3D = null
+var _exhaust_instance: Node3D = null
+var _underglow_lights: Array = []
+var _underglow_accum: float = 0.0
 
-# ---------------------------------------------------------------------------
-# Shader source for the paint material
-# ---------------------------------------------------------------------------
-const PAINT_SHADER_CODE := """
+var _saved_configs: Dictionary = {}   # name -> config Dictionary
+
+## -----------------------------------------------------------------------------
+## Lifecycle
+## -----------------------------------------------------------------------------
+func _ready() -> void:
+	if target_vehicle_path != NodePath(""):
+		_vehicle = get_node_or_null(target_vehicle_path)
+	if _vehicle == null:
+		# Try common fallbacks — parent or sibling named "Vehicle".
+		var parent_node = get_parent()
+		if parent_node is Node3D:
+			_vehicle = parent_node
+		else:
+			var sibling = get_parent().get_node_or_null("Vehicle") if get_parent() else null
+			if sibling is Node3D:
+				_vehicle = sibling
+
+	if _vehicle != null:
+		_discover_scene_nodes()
+	else:
+		push_warning("[VehicleCustomizer] No target vehicle resolved — customizer is idle.")
+
+	_load_all_configs_from_disk()
+
+	if auto_apply_on_ready and _vehicle != null:
+		apply_full_configuration()
+
+func _process(delta: float) -> void:
+	if underglow_pattern == "off" or _underglow_lights.is_empty():
+		return
+	_underglow_accum += delta
+	_animate_underglow(delta)
+
+## -----------------------------------------------------------------------------
+## Scene discovery
+## -----------------------------------------------------------------------------
+func _discover_scene_nodes() -> void:
+	_body_mesh = _vehicle.get_node_or_null("BodyMesh") as MeshInstance3D
+	_wheel_meshes.clear()
+	for i in range(4):
+		var wm = _vehicle.get_node_or_null("WheelMesh_" + str(i))
+		if wm is MeshInstance3D:
+			_wheel_meshes.append(wm)
+	_spoiler_mount = _vehicle.get_node_or_null("SpoilerMount") as Node3D
+	_exhaust_mount = _vehicle.get_node_or_null("ExhaustMount") as Node3D
+	_underglow_anchor = _vehicle.get_node_or_null("UnderglowAnchor") as Node3D
+
+	if _body_mesh == null:
+		push_warning("[VehicleCustomizer] BodyMesh not found — paint and decal systems disabled.")
+	if _wheel_meshes.size() < 4:
+		push_warning("[VehicleCustomizer] Fewer than 4 WheelMesh_N nodes found — wheel swap will be partial.")
+	if _spoiler_mount == null:
+		push_warning("[VehicleCustomizer] SpoilerMount not found — spoilers disabled.")
+	if _exhaust_mount == null:
+		push_warning("[VehicleCustomizer] ExhaustMount not found — exhausts disabled.")
+
+## -----------------------------------------------------------------------------
+## Paint — ShaderMaterial construction
+## -----------------------------------------------------------------------------
+func _build_paint_shader_code() -> String:
+	# A compact, procedural paint shader supporting four finishes. The shader is
+	# built at runtime so the class has no hard dependency on an external .gdshader
+	# asset, which keeps the customizer self-contained.
+	return """
 shader_type spatial;
-render_mode blend_mix, depth_draw_opaque, cull_back, diffuse_lambert, specular_schlick_ggx;
+render_mode blend_mix, depth_draw_opaque, cull_back, diffuse_burley, specular_schlick_ggx;
 
-uniform vec4 albedo_color : source_color = vec4(0.1, 0.5, 1.0, 1.0);
-uniform vec4 secondary_color : source_color = vec4(0.05, 0.05, 0.05, 1.0);
-uniform float metallic_value : hint_range(0.0, 1.0) = 0.8;
-uniform float roughness_value : hint_range(0.0, 1.0) = 0.2;
-uniform float specular_value : hint_range(0.0, 1.0) = 0.8;
-uniform float clearcoat_value : hint_range(0.0, 1.0) = 0.5;
-uniform float clearcoat_roughness : hint_range(0.0, 1.0) = 0.05;
-uniform float anisotropy_value : hint_range(-1.0, 1.0) = 0.0;
-uniform int finish_mode : hint_range(0, 5) = 0;
-uniform float flake_strength : hint_range(0.0, 1.0) = 0.0;
-uniform float pearl_shift : hint_range(0.0, 1.0) = 0.0;
-uniform sampler2D flake_texture : hint_default_white;
+uniform vec4 paint_color : source_color = vec4(0.85, 0.12, 0.14, 1.0);
+uniform float metallic_amt : hint_range(0.0, 1.0) = 0.85;
+uniform float roughness_amt : hint_range(0.0, 1.0) = 0.25;
+uniform float clearcoat_amt : hint_range(0.0, 1.0) = 0.5;
+uniform vec4 pearl_shift : source_color = vec4(0.2, 0.4, 1.0, 1.0);
+uniform int finish_mode = 0; // 0 metallic, 1 matte, 2 chrome, 3 pearlescent
+uniform float flake_density : hint_range(0.0, 50.0) = 18.0;
+uniform float flake_intensity : hint_range(0.0, 1.0) = 0.25;
 
-varying vec3 world_normal;
-varying vec3 world_pos;
-
-float rand(vec2 co) {
-	return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
-}
-
-void vertex() {
-	world_normal = (MODEL_MATRIX * vec4(NORMAL, 0.0)).xyz;
-	world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+float hash21(vec2 p) {
+	p = fract(p * vec2(123.34, 456.21));
+	p += dot(p, p + 45.32);
+	return fract(p.x * p.y);
 }
 
 void fragment() {
-	vec3 base = albedo_color.rgb;
+	vec3 base = paint_color.rgb;
+	float m = metallic_amt;
+	float r = roughness_amt;
+	float c = clearcoat_amt;
 
-	// Pearl shift based on view angle
-	if (finish_mode == 3) { // pearlescent
-		float view_dot = abs(dot(normalize(VIEW), normalize(NORMAL)));
-		float shift = sin(view_dot * 3.14159 + pearl_shift * 6.28) * 0.5 + 0.5;
-		base = mix(base, secondary_color.rgb, shift * 0.6);
+	if (finish_mode == 1) {
+		// Matte
+		m = 0.0;
+		r = clamp(roughness_amt + 0.55, 0.5, 1.0);
+		c = 0.0;
+	} else if (finish_mode == 2) {
+		// Chrome — tint base heavily toward neutral metallic
+		base = mix(base, vec3(0.92, 0.92, 0.94), 0.75);
+		m = 1.0;
+		r = 0.05;
+		c = 1.0;
+	} else if (finish_mode == 3) {
+		// Pearlescent — Fresnel-shifted color
+		float fresnel = pow(1.0 - clamp(dot(normalize(NORMAL), normalize(VIEW)), 0.0, 1.0), 3.0);
+		base = mix(base, pearl_shift.rgb, fresnel);
+		m = 0.6;
+		r = 0.2;
+		c = 0.8;
 	}
 
-	// Candy — deep saturated base with high specular glow
-	if (finish_mode == 4) {
-		base = pow(base, vec3(1.5));
+	// Metallic flakes — only visible on metallic / pearl.
+	if (finish_mode == 0 || finish_mode == 3) {
+		vec2 flake_uv = UV * flake_density;
+		float flake = step(0.97, hash21(floor(flake_uv)));
+		base += vec3(flake) * flake_intensity;
 	}
-
-	// Metallic flakes
-	vec2 uv_scaled = UV * 80.0;
-	float flake = texture(flake_texture, uv_scaled).r;
-	float noise = rand(floor(uv_scaled));
-	base += flake * noise * flake_strength * 0.4;
 
 	ALBEDO = base;
-	METALLIC = metallic_value;
-	ROUGHNESS = roughness_value;
-	SPECULAR = specular_value;
-	CLEARCOAT = clearcoat_value;
-	CLEARCOAT_ROUGHNESS = clearcoat_roughness;
-	ANISOTROPY = anisotropy_value;
+	METALLIC = m;
+	ROUGHNESS = r;
+	CLEARCOAT = c;
+	CLEARCOAT_ROUGHNESS = 0.1;
 }
 """
 
-# ---------------------------------------------------------------------------
-# Lifecycle
-# ---------------------------------------------------------------------------
-func _ready() -> void:
-	_build_paint_material()
-
-func attach_vehicle(vehicle: Node3D) -> void:
-	vehicle_node = vehicle
-	body_mesh = vehicle.get_node_or_null("MeshInstance3D")
-	_collect_wheel_meshes()
-	_setup_underglow()
-	apply_config(current_config)
-
-func detach_vehicle() -> void:
-	vehicle_node = null
-	body_mesh = null
-	wheel_mesh_instances.clear()
-	decal_nodes.clear()
-	underglow_lights.clear()
-
-# ---------------------------------------------------------------------------
-# Paint material
-# ---------------------------------------------------------------------------
-func _build_paint_material() -> void:
-	var shader := Shader.new()
-	shader.code = PAINT_SHADER_CODE
+func _ensure_paint_material() -> void:
+	if _paint_material != null:
+		return
 	_paint_material = ShaderMaterial.new()
-	_paint_material.shader = shader
+	var sh := Shader.new()
+	sh.code = _build_paint_shader_code()
+	_paint_material.shader = sh
 
-func _apply_paint_finish(finish: String) -> void:
+func _apply_paint_params() -> void:
+	_ensure_paint_material()
+	_paint_material.set_shader_parameter("paint_color", paint_color)
+	_paint_material.set_shader_parameter("metallic_amt", paint_metallic)
+	_paint_material.set_shader_parameter("roughness_amt", paint_roughness)
+	_paint_material.set_shader_parameter("clearcoat_amt", paint_clearcoat)
+	_paint_material.set_shader_parameter("pearl_shift", paint_pearl_shift)
+	_paint_material.set_shader_parameter("finish_mode", _finish_to_mode(paint_finish))
+
+func _finish_to_mode(finish: String) -> int:
 	match finish:
+		FINISH_METALLIC:    return 0
+		FINISH_MATTE:       return 1
+		FINISH_CHROME:      return 2
+		FINISH_PEARLESCENT: return 3
+	return 0
+
+func set_paint(color: Color, finish: String = "") -> void:
+	paint_color = color
+	if finish != "" and finish in ALL_FINISHES:
+		paint_finish = finish
+	# Finish-specific defaults for metallic/roughness/clearcoat.
+	match paint_finish:
 		FINISH_METALLIC:
-			_paint_material.set_shader_parameter("metallic_value", 0.9)
-			_paint_material.set_shader_parameter("roughness_value", 0.15)
-			_paint_material.set_shader_parameter("clearcoat_value", 0.6)
-			_paint_material.set_shader_parameter("clearcoat_roughness", 0.05)
-			_paint_material.set_shader_parameter("flake_strength", 0.3)
-			_paint_material.set_shader_parameter("pearl_shift", 0.0)
-			_paint_material.set_shader_parameter("finish_mode", 0)
+			paint_metallic = 0.85
+			paint_roughness = 0.25
+			paint_clearcoat = 0.5
 		FINISH_MATTE:
-			_paint_material.set_shader_parameter("metallic_value", 0.0)
-			_paint_material.set_shader_parameter("roughness_value", 0.95)
-			_paint_material.set_shader_parameter("clearcoat_value", 0.0)
-			_paint_material.set_shader_parameter("clearcoat_roughness", 0.9)
-			_paint_material.set_shader_parameter("flake_strength", 0.0)
-			_paint_material.set_shader_parameter("pearl_shift", 0.0)
-			_paint_material.set_shader_parameter("finish_mode", 1)
+			paint_metallic = 0.0
+			paint_roughness = 0.85
+			paint_clearcoat = 0.0
 		FINISH_CHROME:
-			_paint_material.set_shader_parameter("metallic_value", 1.0)
-			_paint_material.set_shader_parameter("roughness_value", 0.02)
-			_paint_material.set_shader_parameter("clearcoat_value", 1.0)
-			_paint_material.set_shader_parameter("clearcoat_roughness", 0.01)
-			_paint_material.set_shader_parameter("flake_strength", 0.0)
-			_paint_material.set_shader_parameter("pearl_shift", 0.0)
-			_paint_material.set_shader_parameter("finish_mode", 2)
+			paint_metallic = 1.0
+			paint_roughness = 0.05
+			paint_clearcoat = 1.0
 		FINISH_PEARLESCENT:
-			_paint_material.set_shader_parameter("metallic_value", 0.4)
-			_paint_material.set_shader_parameter("roughness_value", 0.1)
-			_paint_material.set_shader_parameter("clearcoat_value", 0.8)
-			_paint_material.set_shader_parameter("clearcoat_roughness", 0.03)
-			_paint_material.set_shader_parameter("flake_strength", 0.15)
-			_paint_material.set_shader_parameter("pearl_shift", 0.5)
-			_paint_material.set_shader_parameter("finish_mode", 3)
-		FINISH_CANDY:
-			_paint_material.set_shader_parameter("metallic_value", 0.0)
-			_paint_material.set_shader_parameter("roughness_value", 0.05)
-			_paint_material.set_shader_parameter("clearcoat_value", 1.0)
-			_paint_material.set_shader_parameter("clearcoat_roughness", 0.02)
-			_paint_material.set_shader_parameter("flake_strength", 0.0)
-			_paint_material.set_shader_parameter("pearl_shift", 0.0)
-			_paint_material.set_shader_parameter("finish_mode", 4)
-		FINISH_SATIN:
-			_paint_material.set_shader_parameter("metallic_value", 0.2)
-			_paint_material.set_shader_parameter("roughness_value", 0.45)
-			_paint_material.set_shader_parameter("clearcoat_value", 0.2)
-			_paint_material.set_shader_parameter("clearcoat_roughness", 0.3)
-			_paint_material.set_shader_parameter("flake_strength", 0.0)
-			_paint_material.set_shader_parameter("pearl_shift", 0.0)
-			_paint_material.set_shader_parameter("finish_mode", 5)
+			paint_metallic = 0.6
+			paint_roughness = 0.2
+			paint_clearcoat = 0.8
+	_apply_paint_params()
+	if _body_mesh != null:
+		_body_mesh.material_override = _paint_material
+	emit_signal("paint_changed", paint_color, paint_finish)
 
-# ---------------------------------------------------------------------------
-# Public customisation API
-# ---------------------------------------------------------------------------
-func set_paint_color(color: Color, finish: String = FINISH_METALLIC) -> void:
-	_push_undo()
-	current_config["paint_color"] = color
-	current_config["paint_finish"] = finish
-	_paint_material.set_shader_parameter("albedo_color", color)
-	_apply_paint_finish(finish)
-	if body_mesh:
-		body_mesh.set_surface_override_material(0, _paint_material)
-	emit_signal("paint_changed", color, finish)
+func set_paint_color_hsv(h: float, s: float, v: float) -> void:
+	var c := Color.from_hsv(clamp(h, 0.0, 1.0), clamp(s, 0.0, 1.0), clamp(v, 0.0, 1.0))
+	set_paint(c, paint_finish)
 
-func set_secondary_color(color: Color) -> void:
-	_push_undo()
-	current_config["secondary_color"] = color
-	_paint_material.set_shader_parameter("secondary_color", color)
-
-func set_paint_from_hsv(h: float, s: float, v: float, finish: String = FINISH_METALLIC) -> void:
-	var color := Color.from_hsv(h, s, v)
-	set_paint_color(color, finish)
-
-func set_decal(decal_id: int, color: Color = Color.WHITE, opacity: float = 1.0) -> void:
-	_push_undo()
-	current_config["decal_id"] = decal_id
-	current_config["decal_color"] = color
-	current_config["decal_opacity"] = opacity
-	_update_decals()
-	emit_signal("decal_changed", decal_id)
-
-func set_wheel_style(style_id: int, wheel_color: Color = Color(0.8, 0.8, 0.8)) -> void:
-	_push_undo()
-	current_config["wheel_id"] = style_id
-	current_config["wheel_color"] = wheel_color
-	_update_wheel_meshes()
-	emit_signal("wheel_style_changed", style_id)
-
-func set_spoiler(spoiler_id: int) -> void:
-	_push_undo()
-	current_config["spoiler_id"] = spoiler_id
-	_update_spoiler()
-
-func set_exhaust(exhaust_id: int) -> void:
-	_push_undo()
-	current_config["exhaust_id"] = exhaust_id
-	_update_exhaust()
-
-func set_underglow(enabled: bool, color: Color = Color(0, 1, 1), intensity: float = 2.0) -> void:
-	_push_undo()
-	current_config["underglow_enabled"] = enabled
-	current_config["underglow_color"] = color
-	current_config["underglow_intensity"] = intensity
-	_update_underglow()
-	emit_signal("underglow_changed", color, enabled)
-
-func set_license_plate(text: String) -> void:
-	_push_undo()
-	current_config["license_plate"] = text
-	_update_license_plate(text)
-
-func set_window_tint(opacity: float, color: Color = Color(0, 0, 0)) -> void:
-	_push_undo()
-	current_config["tint_opacity"] = clampf(opacity, 0.0, 0.9)
-	current_config["tint_color"] = color
-	_update_window_tint()
-
-# ---------------------------------------------------------------------------
-# Internal mesh/node updaters
-# ---------------------------------------------------------------------------
-func _update_decals() -> void:
-	if vehicle_node == null:
+func set_paint_finish(finish: String) -> void:
+	if not finish in ALL_FINISHES:
+		push_warning("[VehicleCustomizer] Unknown finish: " + finish)
 		return
-	for d in decal_nodes:
-		if is_instance_valid(d):
-			d.queue_free()
-	decal_nodes.clear()
+	set_paint(paint_color, finish)
 
-	var decal_id: int = current_config["decal_id"]
-	if decal_id == 0:
-		return
+func set_pearl_shift(color: Color) -> void:
+	paint_pearl_shift = color
+	_apply_paint_params()
 
-	var template: Dictionary = {}
-	for t in DECAL_TEMPLATES:
-		if t["id"] == decal_id:
-			template = t
-			break
-	if template.is_empty() or template["texture"] == "":
-		return
+## -----------------------------------------------------------------------------
+## Decals
+## -----------------------------------------------------------------------------
+func list_decal_ids() -> Array:
+	return DECAL_CATALOGUE.keys()
 
-	var texture_path: String = template["texture"]
-	var tex: Texture2D = null
-	if ResourceLoader.exists(texture_path):
-		tex = ResourceLoader.load(texture_path)
+func list_decals_by_category(category: String) -> Array:
+	var out: Array = []
+	for id in DECAL_CATALOGUE.keys():
+		if DECAL_CATALOGUE[id].get("category", "") == category:
+			out.append(id)
+	return out
 
-	var positions := [
-		Vector3(0, 0.6, -1.2),
-		Vector3(1.0, 0.4, 0),
-		Vector3(-1.0, 0.4, 0),
-	]
+func get_decal_info(decal_id: String) -> Dictionary:
+	if DECAL_CATALOGUE.has(decal_id):
+		return DECAL_CATALOGUE[decal_id]
+	return {}
 
-	for pos in positions:
-		var decal := Decal.new()
-		decal.position = pos
-		decal.size = Vector3(2.0, 0.5, 0.1)
-		if tex:
-			decal.texture_albedo = tex
-		decal.modulate = current_config["decal_color"]
-		decal.modulate.a = current_config["decal_opacity"]
-		vehicle_node.add_child(decal)
-		decal_nodes.append(decal)
-
-func _collect_wheel_meshes() -> void:
-	wheel_mesh_instances.clear()
-	if vehicle_node == null:
-		return
-	for child in vehicle_node.get_children():
-		if child is VehicleWheel3D:
-			var mesh := child.get_node_or_null("WheelMesh") as MeshInstance3D
-			if mesh:
-				wheel_mesh_instances.append(mesh)
-
-func _update_wheel_meshes() -> void:
-	var style_id: int = current_config["wheel_id"]
-	var wcolor: Color = current_config["wheel_color"]
-	for mesh in wheel_mesh_instances:
-		if not is_instance_valid(mesh):
-			continue
-		var mat := StandardMaterial3D.new()
-		mat.albedo_color = wcolor
-		mat.metallic = 0.7
-		mat.roughness = 0.2
-		mesh.set_surface_override_material(0, mat)
-
-func _update_spoiler() -> void:
-	if vehicle_node == null:
-		return
-	if spoiler_mesh and is_instance_valid(spoiler_mesh):
-		spoiler_mesh.queue_free()
-		spoiler_mesh = null
-
-	var sid: int = current_config["spoiler_id"]
-	if sid == 0:
-		return
-
-	spoiler_mesh = MeshInstance3D.new()
-	spoiler_mesh.position = Vector3(0, 0.8, 1.5)
-	vehicle_node.add_child(spoiler_mesh)
-
-func _update_exhaust() -> void:
-	if vehicle_node == null:
-		return
-	if exhaust_mesh and is_instance_valid(exhaust_mesh):
-		exhaust_mesh.queue_free()
-		exhaust_mesh = null
-
-	var eid: int = current_config["exhaust_id"]
-	if eid == 0:
-		return
-
-	exhaust_mesh = MeshInstance3D.new()
-	exhaust_mesh.position = Vector3(0, 0.2, 2.0)
-	vehicle_node.add_child(exhaust_mesh)
-
-func _setup_underglow() -> void:
-	if vehicle_node == null:
-		return
-	var offsets := [
-		Vector3(0, 0.1, -1.5),
-		Vector3(0, 0.1,  1.5),
-		Vector3(-1.2, 0.1, 0),
-		Vector3( 1.2, 0.1, 0),
-	]
-	for offset in offsets:
-		var light := OmniLight3D.new()
-		light.position = offset
-		light.omni_range = 2.5
-		light.light_energy = 0.0
-		vehicle_node.add_child(light)
-		underglow_lights.append(light)
-
-func _update_underglow() -> void:
-	var enabled: bool = current_config["underglow_enabled"]
-	var color: Color = current_config["underglow_color"]
-	var intensity: float = current_config["underglow_intensity"]
-	for light in underglow_lights:
-		if not is_instance_valid(light):
-			continue
-		light.light_color = color
-		light.light_energy = intensity if enabled else 0.0
-
-func _update_window_tint() -> void:
-	if vehicle_node == null:
-		return
-	var opacity: float = current_config["tint_opacity"]
-	var color: Color = current_config["tint_color"]
-	color.a = opacity
-	var window_mesh := vehicle_node.get_node_or_null("WindowMesh") as MeshInstance3D
-	if window_mesh == null:
-		return
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = color
-	mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	mat.roughness = 0.0
-	mat.metallic = 0.1
-	window_mesh.set_surface_override_material(0, mat)
-
-func _update_license_plate(text: String) -> void:
-	if vehicle_node == null:
-		return
-	var plate_label := vehicle_node.get_node_or_null("LicensePlate/Label3D") as Label3D
-	if plate_label:
-		plate_label.text = text
-
-# ---------------------------------------------------------------------------
-# Batch apply
-# ---------------------------------------------------------------------------
-func apply_config(config: Dictionary) -> void:
-	current_config = config.duplicate(true)
-	if body_mesh == null:
-		return
-	_paint_material.set_shader_parameter("albedo_color", current_config["paint_color"])
-	_paint_material.set_shader_parameter("secondary_color", current_config.get("secondary_color", Color(0.05, 0.05, 0.05)))
-	_apply_paint_finish(current_config.get("paint_finish", FINISH_METALLIC))
-	body_mesh.set_surface_override_material(0, _paint_material)
-	_update_decals()
-	_update_wheel_meshes()
-	_update_spoiler()
-	_update_exhaust()
-	_update_underglow()
-	_update_window_tint()
-	emit_signal("customization_applied", current_config)
-
-# ---------------------------------------------------------------------------
-# Undo / Redo
-# ---------------------------------------------------------------------------
-func _push_undo() -> void:
-	_undo_stack.append(current_config.duplicate(true))
-	if _undo_stack.size() > MAX_UNDO:
-		_undo_stack.pop_front()
-	_redo_stack.clear()
-
-func undo() -> void:
-	if _undo_stack.is_empty():
-		return
-	_redo_stack.append(current_config.duplicate(true))
-	var prev := _undo_stack.pop_back()
-	apply_config(prev)
-
-func redo() -> void:
-	if _redo_stack.is_empty():
-		return
-	_undo_stack.append(current_config.duplicate(true))
-	var next := _redo_stack.pop_back()
-	apply_config(next)
-
-func can_undo() -> bool:
-	return not _undo_stack.is_empty()
-
-func can_redo() -> bool:
-	return not _redo_stack.is_empty()
-
-# ---------------------------------------------------------------------------
-# Save / Load configurations
-# ---------------------------------------------------------------------------
-func save_config(config_name: String) -> String:
-	var config_id := config_name.strip_edges().replace(" ", "_").to_lower()
-	if config_id == "":
-		config_id = "config_" + str(Time.get_unix_time_from_system())
-	_saved_configs[config_id] = current_config.duplicate(true)
-	_persist_configs()
-	emit_signal("config_saved", config_id)
-	print("[VehicleCustomizer] Config saved: ", config_id)
-	return config_id
-
-func load_config(config_id: String) -> bool:
-	if not _saved_configs.has(config_id):
-		print("[VehicleCustomizer] Config not found: ", config_id)
+func apply_decal(slot: int, decal_id: String) -> bool:
+	if slot < 0 or slot >= DECAL_SLOT_COUNT:
+		push_warning("[VehicleCustomizer] apply_decal: slot out of range: " + str(slot))
 		return false
-	apply_config(_saved_configs[config_id])
-	emit_signal("config_loaded", current_config)
+	if not DECAL_CATALOGUE.has(decal_id):
+		push_warning("[VehicleCustomizer] apply_decal: unknown decal_id: " + decal_id)
+		return false
+	if _vehicle == null:
+		return false
+
+	# Reuse existing Decal node per slot to avoid churn.
+	var decal_node: Decal = _decal_nodes.get(slot, null)
+	if decal_node == null:
+		decal_node = Decal.new()
+		decal_node.name = "Decal_Slot_" + str(slot)
+		decal_node.size = Vector3(1.2, 0.5, 1.2)
+		decal_node.cull_mask = 1
+		decal_node.upper_fade = 0.3
+		decal_node.lower_fade = 0.3
+		_vehicle.add_child(decal_node)
+		_decal_nodes[slot] = decal_node
+
+	var tex_path: String = DECAL_CATALOGUE[decal_id].get("path", "")
+	var tex: Texture2D = null
+	if tex_path != "" and ResourceLoader.exists(tex_path):
+		tex = load(tex_path)
+	if tex != null:
+		decal_node.texture_albedo = tex
+
+	decal_node.transform = _get_decal_transform_for_slot(slot)
+	decal_node.visible = true
+	active_decals[slot] = decal_id
+	emit_signal("decal_applied", decal_id, slot)
 	return true
 
-func delete_config(config_id: String) -> void:
-	_saved_configs.erase(config_id)
-	_persist_configs()
+func remove_decal(slot: int) -> void:
+	if not active_decals.has(slot):
+		return
+	active_decals.erase(slot)
+	if _decal_nodes.has(slot):
+		var d: Decal = _decal_nodes[slot]
+		d.visible = false
+	emit_signal("decal_removed", slot)
 
-func get_saved_config_ids() -> Array:
+func clear_all_decals() -> void:
+	var slots = active_decals.keys()
+	for s in slots:
+		remove_decal(s)
+
+func _get_decal_transform_for_slot(slot: int) -> Transform3D:
+	# Six canonical positions: hood, roof, trunk, left door, right door, rear.
+	var t := Transform3D.IDENTITY
+	match slot:
+		0: # Hood
+			t.origin = Vector3(0.0, 0.6, 1.4)
+			t.basis = Basis(Vector3.RIGHT, -PI * 0.5)
+		1: # Roof
+			t.origin = Vector3(0.0, 1.1, 0.0)
+			t.basis = Basis(Vector3.RIGHT, -PI * 0.5)
+		2: # Trunk
+			t.origin = Vector3(0.0, 0.6, -1.4)
+			t.basis = Basis(Vector3.RIGHT, -PI * 0.5)
+		3: # Left door
+			t.origin = Vector3(-0.95, 0.5, 0.0)
+			t.basis = Basis(Vector3.UP, PI * 0.5) * Basis(Vector3.RIGHT, -PI * 0.5)
+		4: # Right door
+			t.origin = Vector3(0.95, 0.5, 0.0)
+			t.basis = Basis(Vector3.UP, -PI * 0.5) * Basis(Vector3.RIGHT, -PI * 0.5)
+		5: # Rear window
+			t.origin = Vector3(0.0, 0.95, -0.9)
+			t.basis = Basis(Vector3.RIGHT, -PI * 0.5)
+	return t
+
+## -----------------------------------------------------------------------------
+## Wheels
+## -----------------------------------------------------------------------------
+func list_wheel_ids() -> Array:
+	return WHEEL_CATALOGUE.keys()
+
+func get_wheel_info(wheel_id: String) -> Dictionary:
+	if WHEEL_CATALOGUE.has(wheel_id):
+		return WHEEL_CATALOGUE[wheel_id]
+	return {}
+
+func set_wheels(wheel_id: String) -> bool:
+	if not WHEEL_CATALOGUE.has(wheel_id):
+		push_warning("[VehicleCustomizer] Unknown wheel_id: " + wheel_id)
+		return false
+	wheels_id = wheel_id
+	_apply_wheels()
+	emit_signal("wheels_changed", wheel_id)
+	return true
+
+func _apply_wheels() -> void:
+	if _wheel_meshes.is_empty():
+		return
+	var info: Dictionary = WHEEL_CATALOGUE.get(wheels_id, {})
+	var rim_color: Color = info.get("rim_color", Color(0.5, 0.5, 0.5))
+	var glow: bool = info.get("glow", false)
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = rim_color
+	mat.metallic = 0.9
+	mat.roughness = 0.25
+	if glow:
+		mat.emission_enabled = true
+		mat.emission = rim_color
+		mat.emission_energy_multiplier = 2.4
+	for wm in _wheel_meshes:
+		if wm is MeshInstance3D:
+			wm.material_override = mat
+
+## -----------------------------------------------------------------------------
+## Spoiler
+## -----------------------------------------------------------------------------
+func list_spoiler_ids() -> Array:
+	return SPOILER_CATALOGUE.keys()
+
+func get_spoiler_info(spoiler_id_: String) -> Dictionary:
+	if SPOILER_CATALOGUE.has(spoiler_id_):
+		return SPOILER_CATALOGUE[spoiler_id_]
+	return {}
+
+func set_spoiler(spoiler_id_: String) -> bool:
+	if not SPOILER_CATALOGUE.has(spoiler_id_):
+		push_warning("[VehicleCustomizer] Unknown spoiler_id: " + spoiler_id_)
+		return false
+	spoiler_id = spoiler_id_
+	_apply_spoiler()
+	emit_signal("spoiler_changed", spoiler_id)
+	return true
+
+func _apply_spoiler() -> void:
+	if _spoiler_mount == null:
+		return
+	if _spoiler_instance != null and is_instance_valid(_spoiler_instance):
+		_spoiler_instance.queue_free()
+		_spoiler_instance = null
+	if spoiler_id == "none":
+		return
+	var info: Dictionary = SPOILER_CATALOGUE[spoiler_id]
+	var mi := MeshInstance3D.new()
+	mi.name = "Spoiler_" + spoiler_id
+	var box := BoxMesh.new()
+	box.size = Vector3(1.5, 0.08, 0.25)
+	mi.mesh = box
+	mi.position = Vector3(0, 0.25 + info.get("downforce", 0.0) * 0.3, 0)
+	_spoiler_mount.add_child(mi)
+	_spoiler_instance = mi
+
+func get_spoiler_downforce() -> float:
+	return float(SPOILER_CATALOGUE.get(spoiler_id, {}).get("downforce", 0.0))
+
+func get_spoiler_drag() -> float:
+	return float(SPOILER_CATALOGUE.get(spoiler_id, {}).get("drag", 0.0))
+
+## -----------------------------------------------------------------------------
+## Exhaust
+## -----------------------------------------------------------------------------
+func list_exhaust_ids() -> Array:
+	return EXHAUST_CATALOGUE.keys()
+
+func get_exhaust_info(exhaust_id_: String) -> Dictionary:
+	if EXHAUST_CATALOGUE.has(exhaust_id_):
+		return EXHAUST_CATALOGUE[exhaust_id_]
+	return {}
+
+func set_exhaust(exhaust_id_: String) -> bool:
+	if not EXHAUST_CATALOGUE.has(exhaust_id_):
+		push_warning("[VehicleCustomizer] Unknown exhaust_id: " + exhaust_id_)
+		return false
+	exhaust_id = exhaust_id_
+	_apply_exhaust()
+	emit_signal("exhaust_changed", exhaust_id)
+	return true
+
+func _apply_exhaust() -> void:
+	if _exhaust_mount == null:
+		return
+	if _exhaust_instance != null and is_instance_valid(_exhaust_instance):
+		_exhaust_instance.queue_free()
+		_exhaust_instance = null
+	var info: Dictionary = EXHAUST_CATALOGUE.get(exhaust_id, {})
+	var tip_count: int = int(info.get("tip_count", 1))
+	var group := Node3D.new()
+	group.name = "Exhaust_" + exhaust_id
+	var spacing: float = 0.2
+	var start_x: float = -spacing * float(tip_count - 1) * 0.5
+	for i in range(tip_count):
+		var mi := MeshInstance3D.new()
+		var cyl := CylinderMesh.new()
+		cyl.top_radius = 0.06
+		cyl.bottom_radius = 0.06
+		cyl.height = 0.25
+		mi.mesh = cyl
+		mi.position = Vector3(start_x + float(i) * spacing, 0.0, 0.0)
+		mi.rotation = Vector3(PI * 0.5, 0.0, 0.0)
+		var mat := StandardMaterial3D.new()
+		mat.albedo_color = Color(0.15, 0.15, 0.15)
+		mat.metallic = 1.0
+		mat.roughness = 0.2
+		mi.material_override = mat
+		group.add_child(mi)
+	_exhaust_mount.add_child(group)
+	_exhaust_instance = group
+
+## -----------------------------------------------------------------------------
+## Underglow
+## -----------------------------------------------------------------------------
+func set_underglow(color: Color, pattern: String = "solid", intensity: float = 1.0) -> void:
+	if not pattern in UNDERGLOW_PATTERNS:
+		push_warning("[VehicleCustomizer] Unknown underglow pattern: " + pattern)
+		pattern = "solid"
+	underglow_color = color
+	underglow_pattern = pattern
+	underglow_intensity = clamp(intensity, 0.0, 4.0)
+	_apply_underglow()
+	emit_signal("underglow_changed", underglow_color, underglow_pattern)
+
+func _apply_underglow() -> void:
+	if _underglow_anchor == null:
+		return
+	# Clear existing
+	for l in _underglow_lights:
+		if is_instance_valid(l):
+			l.queue_free()
+	_underglow_lights.clear()
+	if underglow_pattern == "off":
+		return
+	# Four lights positioned at the corners under the chassis.
+	var positions := [
+		Vector3(-0.9, -0.35, 1.2),
+		Vector3( 0.9, -0.35, 1.2),
+		Vector3(-0.9, -0.35, -1.2),
+		Vector3( 0.9, -0.35, -1.2),
+	]
+	for p in positions:
+		var ol := OmniLight3D.new()
+		ol.light_color = underglow_color
+		ol.light_energy = underglow_intensity * 1.8
+		ol.omni_range = 2.6
+		ol.position = p
+		_underglow_anchor.add_child(ol)
+		_underglow_lights.append(ol)
+
+func _animate_underglow(_delta: float) -> void:
+	match underglow_pattern:
+		"solid":
+			for l in _underglow_lights:
+				l.light_color = underglow_color
+				l.light_energy = underglow_intensity * 1.8
+		"pulse":
+			var amp: float = 0.5 + 0.5 * sin(_underglow_accum * TAU * 1.2)
+			for l in _underglow_lights:
+				l.light_energy = underglow_intensity * (0.6 + 1.4 * amp)
+		"strobe":
+			var on: bool = int(_underglow_accum * 8.0) % 2 == 0
+			for l in _underglow_lights:
+				l.light_energy = underglow_intensity * (2.2 if on else 0.0)
+		"chase":
+			for i in range(_underglow_lights.size()):
+				var phase: float = fposmod(_underglow_accum * 2.0 - float(i) * 0.25, 1.0)
+				_underglow_lights[i].light_energy = underglow_intensity * (0.2 + 2.0 * pow(1.0 - phase, 3.0))
+		"rainbow":
+			var hue: float = fposmod(_underglow_accum * 0.25, 1.0)
+			var c := Color.from_hsv(hue, 0.85, 1.0)
+			for l in _underglow_lights:
+				l.light_color = c
+				l.light_energy = underglow_intensity * 1.8
+
+## -----------------------------------------------------------------------------
+## Full apply / reset
+## -----------------------------------------------------------------------------
+func apply_full_configuration() -> void:
+	_apply_paint_params()
+	if _body_mesh != null:
+		_body_mesh.material_override = _paint_material
+	# Re-apply decals from stored active_decals dictionary.
+	var slots = active_decals.keys()
+	for s in slots:
+		apply_decal(s, active_decals[s])
+	_apply_wheels()
+	_apply_spoiler()
+	_apply_exhaust()
+	_apply_underglow()
+
+func reset_to_stock() -> void:
+	paint_color = DEFAULT_PAINT_COLOR
+	paint_finish = FINISH_METALLIC
+	set_paint(paint_color, paint_finish)
+	clear_all_decals()
+	set_wheels("stock_5spoke")
+	set_spoiler("none")
+	set_exhaust("stock")
+	set_underglow(Color(0.1, 0.6, 1.0), "off", 1.0)
+
+## -----------------------------------------------------------------------------
+## Configuration serialization
+## -----------------------------------------------------------------------------
+func export_configuration() -> Dictionary:
+	return {
+		"version": 1,
+		"owner": profile_user_id,
+		"paint": {
+			"color": [paint_color.r, paint_color.g, paint_color.b, paint_color.a],
+			"finish": paint_finish,
+			"metallic": paint_metallic,
+			"roughness": paint_roughness,
+			"clearcoat": paint_clearcoat,
+			"pearl_shift": [paint_pearl_shift.r, paint_pearl_shift.g, paint_pearl_shift.b, paint_pearl_shift.a],
+		},
+		"decals": active_decals.duplicate(true),
+		"wheels": wheels_id,
+		"spoiler": spoiler_id,
+		"exhaust": exhaust_id,
+		"underglow": {
+			"color": [underglow_color.r, underglow_color.g, underglow_color.b, underglow_color.a],
+			"pattern": underglow_pattern,
+			"intensity": underglow_intensity,
+		},
+	}
+
+func import_configuration(cfg: Dictionary) -> bool:
+	if cfg.is_empty():
+		return false
+	var paint: Dictionary = cfg.get("paint", {})
+	if not paint.is_empty():
+		var c_arr = paint.get("color", [DEFAULT_PAINT_COLOR.r, DEFAULT_PAINT_COLOR.g, DEFAULT_PAINT_COLOR.b, 1.0])
+		paint_color = Color(c_arr[0], c_arr[1], c_arr[2], c_arr[3] if c_arr.size() > 3 else 1.0)
+		paint_finish = String(paint.get("finish", FINISH_METALLIC))
+		paint_metallic = float(paint.get("metallic", 0.85))
+		paint_roughness = float(paint.get("roughness", 0.25))
+		paint_clearcoat = float(paint.get("clearcoat", 0.5))
+		var p_arr = paint.get("pearl_shift", [0.2, 0.4, 1.0, 1.0])
+		paint_pearl_shift = Color(p_arr[0], p_arr[1], p_arr[2], p_arr[3] if p_arr.size() > 3 else 1.0)
+
+	active_decals.clear()
+	var raw_decals: Dictionary = cfg.get("decals", {})
+	for k in raw_decals.keys():
+		active_decals[int(k)] = String(raw_decals[k])
+
+	wheels_id = String(cfg.get("wheels", "stock_5spoke"))
+	spoiler_id = String(cfg.get("spoiler", "none"))
+	exhaust_id = String(cfg.get("exhaust", "stock"))
+
+	var ug: Dictionary = cfg.get("underglow", {})
+	if not ug.is_empty():
+		var uc_arr = ug.get("color", [0.1, 0.6, 1.0, 1.0])
+		underglow_color = Color(uc_arr[0], uc_arr[1], uc_arr[2], uc_arr[3] if uc_arr.size() > 3 else 1.0)
+		underglow_pattern = String(ug.get("pattern", "off"))
+		underglow_intensity = float(ug.get("intensity", 1.0))
+
+	apply_full_configuration()
+	return true
+
+func save_configuration(config_name: String) -> bool:
+	if config_name == "":
+		return false
+	_saved_configs[config_name] = export_configuration()
+	var ok := _persist_configs_to_disk()
+	if ok:
+		emit_signal("configuration_saved", config_name)
+	return ok
+
+func load_configuration(config_name: String) -> bool:
+	if not _saved_configs.has(config_name):
+		push_warning("[VehicleCustomizer] No saved config named: " + config_name)
+		return false
+	var ok := import_configuration(_saved_configs[config_name])
+	if ok:
+		emit_signal("configuration_loaded", config_name)
+	return ok
+
+func delete_configuration(config_name: String) -> bool:
+	if not _saved_configs.has(config_name):
+		return false
+	_saved_configs.erase(config_name)
+	return _persist_configs_to_disk()
+
+func list_saved_configurations() -> Array:
 	return _saved_configs.keys()
 
-func get_config_preview(config_id: String) -> Dictionary:
-	return _saved_configs.get(config_id, {})
+func _persist_configs_to_disk() -> bool:
+	var f := FileAccess.open(CONFIG_FILE_PATH, FileAccess.WRITE)
+	if f == null:
+		push_warning("[VehicleCustomizer] Could not open config file for write.")
+		return false
+	f.store_string(JSON.stringify({"version": 1, "configs": _saved_configs}))
+	f.close()
+	return true
 
-func _persist_configs() -> void:
-	var player_data := get_node_or_null("/root/PlayerData")
-	if player_data and player_data.has_method("set_vehicle_configs"):
-		player_data.set_vehicle_configs(_saved_configs)
-	else:
-		var file := FileAccess.open("user://vehicle_configs.json", FileAccess.WRITE)
-		if file:
-			file.store_string(JSON.stringify(_saved_configs, "\t"))
-
-func load_persisted_configs() -> void:
-	var player_data := get_node_or_null("/root/PlayerData")
-	if player_data and player_data.has_method("get_vehicle_configs"):
-		_saved_configs = player_data.get_vehicle_configs()
+func _load_all_configs_from_disk() -> void:
+	if not FileAccess.file_exists(CONFIG_FILE_PATH):
 		return
-	if FileAccess.file_exists("user://vehicle_configs.json"):
-		var file := FileAccess.open("user://vehicle_configs.json", FileAccess.READ)
-		if file:
-			var result := JSON.parse_string(file.get_as_text())
-			if result is Dictionary:
-				_saved_configs = result
+	var f := FileAccess.open(CONFIG_FILE_PATH, FileAccess.READ)
+	if f == null:
+		return
+	var text := f.get_as_text()
+	f.close()
+	var parsed = JSON.parse_string(text)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return
+	var cfgs = parsed.get("configs", {})
+	if typeof(cfgs) == TYPE_DICTIONARY:
+		_saved_configs = cfgs
 
-# ---------------------------------------------------------------------------
-# Config serialisation helpers (for network / marketplace)
-# ---------------------------------------------------------------------------
-func config_to_json() -> String:
-	var export_config := current_config.duplicate(true)
-	export_config["paint_color"] = _color_to_dict(current_config["paint_color"])
-	export_config["secondary_color"] = _color_to_dict(current_config.get("secondary_color", Color.BLACK))
-	export_config["decal_color"] = _color_to_dict(current_config["decal_color"])
-	export_config["wheel_color"] = _color_to_dict(current_config["wheel_color"])
-	export_config["underglow_color"] = _color_to_dict(current_config["underglow_color"])
-	export_config["tint_color"] = _color_to_dict(current_config.get("tint_color", Color.BLACK))
-	return JSON.stringify(export_config)
+## -----------------------------------------------------------------------------
+## Pricing helpers
+## -----------------------------------------------------------------------------
+func price_of_decal(decal_id: String) -> int:
+	return int(DECAL_CATALOGUE.get(decal_id, {}).get("price", 0))
 
-func config_from_json(json_str: String) -> Dictionary:
-	var parsed = JSON.parse_string(json_str)
-	if not parsed is Dictionary:
-		return {}
-	if parsed.has("paint_color"):
-		parsed["paint_color"] = _dict_to_color(parsed["paint_color"])
-	if parsed.has("secondary_color"):
-		parsed["secondary_color"] = _dict_to_color(parsed["secondary_color"])
-	if parsed.has("decal_color"):
-		parsed["decal_color"] = _dict_to_color(parsed["decal_color"])
-	if parsed.has("wheel_color"):
-		parsed["wheel_color"] = _dict_to_color(parsed["wheel_color"])
-	if parsed.has("underglow_color"):
-		parsed["underglow_color"] = _dict_to_color(parsed["underglow_color"])
-	if parsed.has("tint_color"):
-		parsed["tint_color"] = _dict_to_color(parsed["tint_color"])
-	return parsed
+func price_of_wheels(wheel_id: String) -> int:
+	return int(WHEEL_CATALOGUE.get(wheel_id, {}).get("price", 0))
 
-func _color_to_dict(c: Color) -> Dictionary:
-	return {"r": c.r, "g": c.g, "b": c.b, "a": c.a}
+func price_of_spoiler(spoiler_id_: String) -> int:
+	return int(SPOILER_CATALOGUE.get(spoiler_id_, {}).get("price", 0))
 
-func _dict_to_color(d: Dictionary) -> Color:
-	return Color(d.get("r", 0), d.get("g", 0), d.get("b", 0), d.get("a", 1))
+func price_of_exhaust(exhaust_id_: String) -> int:
+	return int(EXHAUST_CATALOGUE.get(exhaust_id_, {}).get("price", 0))
 
-# ---------------------------------------------------------------------------
-# Randomise
-# ---------------------------------------------------------------------------
-func randomise_paint() -> void:
-	var h := randf()
-	var s := randf_range(0.6, 1.0)
-	var brightness := randf_range(0.5, 1.0)
-	var finish := ALL_FINISHES[randi() % ALL_FINISHES.size()]
-	set_paint_from_hsv(h, s, brightness, finish)
+func total_configuration_price() -> int:
+	var sum := 0
+	for slot_id in active_decals.keys():
+		sum += price_of_decal(active_decals[slot_id])
+	sum += price_of_wheels(wheels_id)
+	sum += price_of_spoiler(spoiler_id)
+	sum += price_of_exhaust(exhaust_id)
+	return sum
 
-func randomise_decal() -> void:
-	var id := randi() % DECAL_TEMPLATES.size()
-	var color := Color(randf(), randf(), randf())
-	set_decal(id, color, randf_range(0.5, 1.0))
+## -----------------------------------------------------------------------------
+## Snapshots (for marketplace / garage collection thumbnails)
+## -----------------------------------------------------------------------------
+func capture_snapshot() -> Image:
+	var vp := get_viewport()
+	if vp == null:
+		return null
+	var tex := vp.get_texture()
+	if tex == null:
+		return null
+	var img := tex.get_image()
+	if img == null:
+		return null
+	img.resize(SNAPSHOT_SIZE.x, SNAPSHOT_SIZE.y, Image.INTERPOLATE_LANCZOS)
+	emit_signal("snapshot_captured", img)
+	return img
 
-func randomise_wheels() -> void:
-	var id := randi() % WHEEL_STYLES.size()
-	var color := Color(randf_range(0.3, 1.0), randf_range(0.3, 1.0), randf_range(0.3, 1.0))
-	set_wheel_style(id, color)
-
-func randomise_all() -> void:
-	randomise_paint()
-	randomise_decal()
-	randomise_wheels()
-	set_spoiler(randi() % SPOILER_STYLES.size())
-	set_exhaust(randi() % EXHAUST_STYLES.size())
-	set_underglow(randf() > 0.5, Color(randf(), randf(), randf()), randf_range(1.0, 4.0))
-
-# ---------------------------------------------------------------------------
-# Getters for UI
-# ---------------------------------------------------------------------------
-func get_decal_name(id: int) -> String:
-	for t in DECAL_TEMPLATES:
-		if t["id"] == id:
-			return t["name"]
-	return "Unknown"
-
-func get_wheel_name(id: int) -> String:
-	for w in WHEEL_STYLES:
-		if w["id"] == id:
-			return w["name"]
-	return "Unknown"
-
-func get_spoiler_name(id: int) -> String:
-	for s in SPOILER_STYLES:
-		if s["id"] == id:
-			return s["name"]
-	return "Unknown"
-
-func get_exhaust_name(id: int) -> String:
-	for e in EXHAUST_STYLES:
-		if e["id"] == id:
-			return e["name"]
-	return "Unknown"
-
-func get_finish_display_name(finish: String) -> String:
-	match finish:
-		FINISH_METALLIC:    return "Metallic"
-		FINISH_MATTE:       return "Matte"
-		FINISH_CHROME:      return "Chrome"
-		FINISH_PEARLESCENT: return "Pearlescent"
-		FINISH_CANDY:       return "Candy"
-		FINISH_SATIN:       return "Satin"
-	return finish.capitalize()
-
-# ---------------------------------------------------------------------------
-# Before / after snapshot for comparison slider
-# ---------------------------------------------------------------------------
-var _before_config: Dictionary = {}
-
-func snapshot_before() -> void:
-	_before_config = current_config.duplicate(true)
-
-func restore_before() -> void:
-	if not _before_config.is_empty():
-		apply_config(_before_config)
-
-func get_before_config() -> Dictionary:
-	return _before_config.duplicate(true)
+## -----------------------------------------------------------------------------
+## Convenience queries
+## -----------------------------------------------------------------------------
+func summary_string() -> String:
+	var parts := PackedStringArray()
+	parts.append("Paint: #" + paint_color.to_html(false) + " " + paint_finish)
+	parts.append("Wheels: " + String(WHEEL_CATALOGUE.get(wheels_id, {}).get("name", wheels_id)))
+	parts.append("Spoiler: " + String(SPOILER_CATALOGUE.get(spoiler_id, {}).get("name", spoiler_id)))
+	parts.append("Exhaust: " + String(EXHAUST_CATALOGUE.get(exhaust_id, {}).get("name", exhaust_id)))
+	parts.append("Decals: " + str(active_decals.size()))
+	parts.append("Underglow: " + underglow_pattern)
+	return " | ".join(parts)

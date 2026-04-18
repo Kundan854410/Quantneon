@@ -1,1173 +1,1106 @@
-## GarageUI — 3D showroom with orbit camera, comparison slider,
-## purchase confirmation, and "My Collection" panel.
-## Integrates VehicleCustomizer and PerformanceUpgrades.
+## GarageUI
+## -----------------------------------------------------------------------------
+## 3D showroom + full customization UI for the Vehicle Customization Workshop.
+##
+## Responsibilities:
+##   * Builds a 3D showroom scene (SubViewport) with rotating platform, studio
+##     lighting, and orbit camera controls.
+##   * Hosts tabs for Paint, Decals, Wheels, Spoiler, Exhaust, Underglow,
+##     Performance and Marketplace.
+##   * Before / after comparison slider that wipes between two snapshots.
+##   * Purchase confirmation dialog with token cost breakdown.
+##   * "My Collection" grid showing all owned configurations with thumbnails.
+##   * Live spider chart driven by PerformanceUpgrades.spider_chart_points().
+##
+## The UI is built entirely in code so it doesn't require a matching .tscn.
+## Drop this Node under a CanvasLayer and assign the three NodePaths (vehicle,
+## customizer, performance, marketplace) — everything else initializes itself.
+extends Control
+class_name GarageUI
 
-extends CanvasLayer
+## -----------------------------------------------------------------------------
+## Signals
+## -----------------------------------------------------------------------------
+signal purchase_requested(total_cost: int)
+signal purchase_confirmed(total_cost: int)
+signal purchase_cancelled()
+signal tab_changed(tab_name: String)
+signal collection_item_selected(config_name: String)
 
-# ---------------------------------------------------------------------------
-# Signals
-# ---------------------------------------------------------------------------
-signal garage_opened()
-signal garage_closed()
-signal config_purchase_confirmed(config: Dictionary, cost: int)
-signal vehicle_selected(vehicle_id: String)
+## -----------------------------------------------------------------------------
+## Constants
+## -----------------------------------------------------------------------------
+const SHOWROOM_BG: Color = Color(0.04, 0.05, 0.09)
+const ACCENT_COLOR: Color = Color(0.2, 0.85, 1.0)
+const PANEL_BG: Color = Color(0.08, 0.10, 0.15, 0.92)
+const TEXT_MUTED: Color = Color(0.75, 0.8, 0.9)
 
-# ---------------------------------------------------------------------------
-# Sub-system references (set from scene or autoload)
-# ---------------------------------------------------------------------------
-var customizer: Node = null      # VehicleCustomizer instance
-var upgrades: Node = null        # PerformanceUpgrades instance
-var active_vehicle: Node3D = null
+const TAB_PAINT: String = "Paint"
+const TAB_DECALS: String = "Decals"
+const TAB_WHEELS: String = "Wheels"
+const TAB_SPOILER: String = "Spoiler"
+const TAB_EXHAUST: String = "Exhaust"
+const TAB_UNDERGLOW: String = "Underglow"
+const TAB_PERFORMANCE: String = "Performance"
+const TAB_COLLECTION: String = "My Collection"
+const TAB_MARKETPLACE: String = "Marketplace"
 
-# ---------------------------------------------------------------------------
-# Internal state
-# ---------------------------------------------------------------------------
-var _is_open := false
-var _tab_index := 0              # 0=Paint 1=Decals 2=Wheels 3=Body 4=Performance 5=Collection
-var _orbit_yaw := 0.0
-var _orbit_pitch := 15.0
-var _orbit_distance := 6.0
-var _orbit_target := Vector3.ZERO
-var _orbit_dragging := false
-var _drag_last := Vector2.ZERO
-var _comparison_active := false
-var _comparison_value := 0.0    # 0.0 = before, 1.0 = after
-var _platform_rotation := 0.0
-var _auto_rotate := true
-var _collection_vehicles: Array[Dictionary] = []
-var _selected_collection_index := -1
+const ALL_TABS: Array[String] = [
+	TAB_PAINT,
+	TAB_DECALS,
+	TAB_WHEELS,
+	TAB_SPOILER,
+	TAB_EXHAUST,
+	TAB_UNDERGLOW,
+	TAB_PERFORMANCE,
+	TAB_COLLECTION,
+	TAB_MARKETPLACE,
+]
 
-# 3D viewport / sub-viewport for garage showroom
-var _garage_viewport: SubViewport = null
-var _garage_camera: Camera3D = null
-var _platform_node: Node3D = null
-var _studio_lights: Array[DirectionalLight3D] = []
+const PLATFORM_RADIUS: float = 2.6
+const CAMERA_MIN_DISTANCE: float = 3.5
+const CAMERA_MAX_DISTANCE: float = 9.0
+const CAMERA_MIN_PITCH: float = -0.3
+const CAMERA_MAX_PITCH: float = 1.2
 
-# UI root
-var _root_control: Control = null
-var _main_panel: PanelContainer = null
+const AUCTION_DURATION_24H_SEC: int = 86400
+
+## -----------------------------------------------------------------------------
+## Exported fields
+## -----------------------------------------------------------------------------
+@export_node_path("Node3D") var vehicle_path: NodePath
+@export_node_path("Node") var customizer_path: NodePath
+@export_node_path("Node") var performance_path: NodePath
+@export_node_path("Node") var marketplace_path: NodePath
+@export var auto_rotate: bool = true
+@export var auto_rotate_speed_deg_s: float = 14.0
+
+## -----------------------------------------------------------------------------
+## External references
+## -----------------------------------------------------------------------------
+var _vehicle: Node3D = null
+var _customizer: Node = null
+var _performance: Node = null
+var _marketplace: Node = null
+
+## -----------------------------------------------------------------------------
+## 3D showroom state
+## -----------------------------------------------------------------------------
+var _viewport: SubViewport = null
+var _viewport_container: SubViewportContainer = null
+var _showroom_root: Node3D = null
+var _platform: Node3D = null
+var _camera_rig: Node3D = null
+var _camera_yaw: Node3D = null
+var _camera_pitch: Node3D = null
+var _camera: Camera3D = null
+var _studio_lights: Array = []
+
+var _camera_distance: float = 5.5
+var _camera_yaw_rad: float = 0.0
+var _camera_pitch_rad: float = 0.4
+var _dragging: bool = false
+var _platform_rotation: float = 0.0
+
+## -----------------------------------------------------------------------------
+## Layout state
+## -----------------------------------------------------------------------------
+var _root_h: HSplitContainer = null
+var _left_panel: VBoxContainer = null
 var _tab_bar: HBoxContainer = null
-var _content_stack: Control = null
-var _pages: Array[Control] = []
-var _status_bar: Label = null
-var _balance_label: Label = null
-var _viewport_rect: TextureRect = null
-var _comparison_slider: HSlider = null
-var _comparison_before_rect: TextureRect = null
-var _comparison_after_rect: TextureRect = null
-var _comparison_container: Control = null
-var _undo_button: Button = null
-var _redo_button: Button = null
-var _save_button: Button = null
-var _randomise_button: Button = null
-var _close_button: Button = null
-var _spin_toggle: CheckButton = null
-var _zoom_slider: HSlider = null
+var _tab_content: Control = null
+var _status_label: Label = null
+var _token_label: Label = null
 
-# Paint page
-var _paint_color_picker: ColorPickerButton = null
-var _secondary_color_picker: ColorPickerButton = null
-var _finish_option: OptionButton = null
-var _paint_preview_rect: ColorRect = null
+var _current_tab: String = TAB_PAINT
+var _tab_buttons: Dictionary = {}   # name -> Button
 
-# Decal page
-var _decal_grid: GridContainer = null
-var _decal_color_picker: ColorPickerButton = null
-var _decal_opacity_slider: HSlider = null
+## Before / after snapshot compare
+var _before_image: Image = null
+var _after_image: Image = null
+var _compare_overlay: Control = null
+var _compare_slider_value: float = 0.5
 
-# Wheel page
-var _wheel_grid: GridContainer = null
-var _wheel_color_picker: ColorPickerButton = null
+## Pending purchase state
+var _pending_cost: int = 0
+var _confirm_dialog: ConfirmationDialog = null
 
-# Body kit page
-var _spoiler_option: OptionButton = null
-var _exhaust_option: OptionButton = null
-var _underglow_check: CheckButton = null
-var _underglow_color_picker: ColorPickerButton = null
-var _underglow_intensity_slider: HSlider = null
-var _window_tint_slider: HSlider = null
-var _tint_color_picker: ColorPickerButton = null
-var _plate_input: LineEdit = null
+## Spider chart (drawn in code, refreshes on perf updates)
+var _spider_chart_control: Control = null
 
-# Performance page
-var _upgrade_panels: Dictionary = {}   # category -> VBoxContainer
-var _spider_chart_container: Control = null
-var _token_balance_label: Label = null
-
-# Collection page
-var _collection_grid: GridContainer = null
-var _collection_detail_panel: PanelContainer = null
-
-# Purchase dialog
-var _purchase_dialog: AcceptDialog = null
-var _pending_purchase: Dictionary = {}
-
-# ---------------------------------------------------------------------------
-# Lifecycle
-# ---------------------------------------------------------------------------
+## -----------------------------------------------------------------------------
+## Lifecycle
+## -----------------------------------------------------------------------------
 func _ready() -> void:
-	layer = 10
-	_build_ui()
-	visible = false
-	_load_collection()
+	name = "GarageUI"
+	set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	mouse_filter = Control.MOUSE_FILTER_PASS
 
-func _process(delta: float) -> void:
-	if not _is_open:
-		return
-	if _auto_rotate and not _orbit_dragging:
-		_platform_rotation += delta * 20.0
-		if active_vehicle:
-			active_vehicle.rotation_degrees.y = _platform_rotation
-	_update_camera_transform()
+	_resolve_external_refs()
+	_build_layout()
+	_build_showroom()
+	_switch_tab(TAB_PAINT)
+	_refresh_status()
+	_refresh_spider_chart()
 
-# ---------------------------------------------------------------------------
-# Open / Close
-# ---------------------------------------------------------------------------
-func open_garage(vehicle: Node3D = null, cust: Node = null, upg: Node = null) -> void:
-	customizer = cust
-	upgrades = upg
-	active_vehicle = vehicle
-	_is_open = true
-	visible = true
-	Input.set_mouse_mode(Input.MOUSE_MODE_VISIBLE)
-	if customizer:
-		customizer.snapshot_before()
-		_sync_ui_from_config(customizer.current_config)
-	if upgrades:
-		_rebuild_performance_page()
-		upgrades.refresh_spider_chart()
-	_switch_tab(0)
-	emit_signal("garage_opened")
-	print("[GarageUI] Opened")
+func _resolve_external_refs() -> void:
+	if vehicle_path != NodePath(""):
+		_vehicle = get_node_or_null(vehicle_path)
+	if customizer_path != NodePath(""):
+		_customizer = get_node_or_null(customizer_path)
+	if performance_path != NodePath(""):
+		_performance = get_node_or_null(performance_path)
+	if marketplace_path != NodePath(""):
+		_marketplace = get_node_or_null(marketplace_path)
+	if _performance and _performance.has_signal("stats_recomputed"):
+		_performance.connect("stats_recomputed", Callable(self, "_on_stats_recomputed"))
+	if _customizer and _customizer.has_signal("paint_changed"):
+		_customizer.connect("paint_changed", Callable(self, "_on_any_customizer_change"))
 
-func close_garage() -> void:
-	_is_open = false
-	visible = false
-	Input.set_mouse_mode(Input.MOUSE_MODE_CAPTURED)
-	emit_signal("garage_closed")
-	print("[GarageUI] Closed")
-
-# ---------------------------------------------------------------------------
-# UI Construction
-# ---------------------------------------------------------------------------
-func _build_ui() -> void:
-	_root_control = Control.new()
-	_root_control.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	add_child(_root_control)
-
+## -----------------------------------------------------------------------------
+## Layout construction
+## -----------------------------------------------------------------------------
+func _build_layout() -> void:
 	var bg := ColorRect.new()
+	bg.color = SHOWROOM_BG
 	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	bg.color = Color(0, 0, 0, 0.75)
-	_root_control.add_child(bg)
+	bg.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	add_child(bg)
 
-	var hbox := HBoxContainer.new()
-	hbox.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	hbox.add_theme_constant_override("separation", 0)
-	_root_control.add_child(hbox)
+	_root_h = HSplitContainer.new()
+	_root_h.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_root_h.split_offset = 640
+	add_child(_root_h)
 
-	_build_viewport_panel(hbox)
-	_build_side_panel(hbox)
+	# ------------------------------------------------------------------ left: 3D
+	_viewport_container = SubViewportContainer.new()
+	_viewport_container.stretch = true
+	_viewport_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_viewport_container.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_viewport_container.custom_minimum_size = Vector2(480, 480)
+	_viewport_container.gui_input.connect(_on_viewport_gui_input)
+	_root_h.add_child(_viewport_container)
 
-	_build_purchase_dialog()
+	_viewport = SubViewport.new()
+	_viewport.size = Vector2i(960, 720)
+	_viewport.transparent_bg = false
+	_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	_viewport_container.add_child(_viewport)
 
-func _build_viewport_panel(parent: Control) -> void:
-	var vp_container := PanelContainer.new()
-	vp_container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	vp_container.size_flags_stretch_ratio = 2.0
-	parent.add_child(vp_container)
+	# Compare overlay — sits on top of the viewport container.
+	_compare_overlay = Control.new()
+	_compare_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_compare_overlay.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_compare_overlay.draw.connect(_draw_compare_overlay)
+	_compare_overlay.hide()
+	_viewport_container.add_child(_compare_overlay)
 
-	var vbox := VBoxContainer.new()
-	vp_container.add_child(vbox)
+	# ----------------------------------------------------------------- right: UI
+	_left_panel = VBoxContainer.new()
+	_left_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_left_panel.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_left_panel.add_theme_constant_override("separation", 8)
+	_root_h.add_child(_left_panel)
 
-	_viewport_rect = TextureRect.new()
-	_viewport_rect.custom_minimum_size = Vector2(0, 400)
-	_viewport_rect.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_viewport_rect.expand_mode = TextureRect.EXPAND_FIT_WIDTH_PROPORTIONAL
-	_viewport_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	vbox.add_child(_viewport_rect)
-
-	_build_viewport_controls(vbox)
-	_build_comparison_area(vbox)
-
-func _build_viewport_controls(parent: Control) -> void:
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 8)
-	parent.add_child(row)
-
-	_spin_toggle = CheckButton.new()
-	_spin_toggle.text = "Auto Spin"
-	_spin_toggle.button_pressed = true
-	_spin_toggle.toggled.connect(_on_auto_spin_toggled)
-	row.add_child(_spin_toggle)
-
-	var zoom_lbl := Label.new()
-	zoom_lbl.text = "Zoom:"
-	row.add_child(zoom_lbl)
-
-	_zoom_slider = HSlider.new()
-	_zoom_slider.min_value = 2.0
-	_zoom_slider.max_value = 12.0
-	_zoom_slider.value = _orbit_distance
-	_zoom_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_zoom_slider.value_changed.connect(_on_zoom_changed)
-	row.add_child(_zoom_slider)
-
-	var reset_btn := Button.new()
-	reset_btn.text = "Reset View"
-	reset_btn.pressed.connect(_reset_camera)
-	row.add_child(reset_btn)
-
-func _build_comparison_area(parent: Control) -> void:
-	_comparison_container = VBoxContainer.new()
-	_comparison_container.visible = false
-	parent.add_child(_comparison_container)
-
-	var lbl := Label.new()
-	lbl.text = "Before ←———— Comparison Slider ————→ After"
-	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_comparison_container.add_child(lbl)
-
-	_comparison_slider = HSlider.new()
-	_comparison_slider.min_value = 0.0
-	_comparison_slider.max_value = 1.0
-	_comparison_slider.value = 1.0
-	_comparison_slider.step = 0.01
-	_comparison_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_comparison_slider.value_changed.connect(_on_comparison_slider_changed)
-	_comparison_container.add_child(_comparison_slider)
-
-	var row := HBoxContainer.new()
-	_comparison_container.add_child(row)
-
-	var before_btn := Button.new()
-	before_btn.text = "Show Before"
-	before_btn.pressed.connect(_on_show_before)
-	row.add_child(before_btn)
-
-	var after_btn := Button.new()
-	after_btn.text = "Show After"
-	after_btn.pressed.connect(_on_show_after)
-	row.add_child(after_btn)
-
-func _build_side_panel(parent: Control) -> void:
-	_main_panel = PanelContainer.new()
-	_main_panel.custom_minimum_size = Vector2(380, 0)
-	_main_panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_main_panel.size_flags_stretch_ratio = 1.0
-	parent.add_child(_main_panel)
-
-	var vbox := VBoxContainer.new()
-	_main_panel.add_child(vbox)
-
-	_build_top_bar(vbox)
-	_build_tab_bar(vbox)
-	_build_content_area(vbox)
-	_build_action_bar(vbox)
-	_build_status_bar(vbox)
-
-func _build_top_bar(parent: Control) -> void:
-	var row := HBoxContainer.new()
-	parent.add_child(row)
+	# Header with title + token balance
+	var header := HBoxContainer.new()
+	header.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_left_panel.add_child(header)
 
 	var title := Label.new()
-	title.text = "▶ GARAGE"
-	title.add_theme_color_override("font_color", Color(0.3, 0.8, 1.0))
+	title.text = "NEO GARAGE — CUSTOMIZATION WORKSHOP"
+	title.add_theme_font_size_override("font_size", 20)
+	title.add_theme_color_override("font_color", ACCENT_COLOR)
 	title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	row.add_child(title)
+	header.add_child(title)
 
-	_balance_label = Label.new()
-	_balance_label.text = "⬡ 0 QUANT"
-	_balance_label.add_theme_color_override("font_color", Color(1.0, 0.85, 0.0))
-	row.add_child(_balance_label)
+	_token_label = Label.new()
+	_token_label.text = "0 QNT"
+	_token_label.add_theme_color_override("font_color", Color(1.0, 0.88, 0.25))
+	_token_label.add_theme_font_size_override("font_size", 18)
+	header.add_child(_token_label)
 
-	_close_button = Button.new()
-	_close_button.text = "✕"
-	_close_button.pressed.connect(close_garage)
-	row.add_child(_close_button)
-
-func _build_tab_bar(parent: Control) -> void:
+	# Tab bar
 	_tab_bar = HBoxContainer.new()
-	_tab_bar.add_theme_constant_override("separation", 2)
-	parent.add_child(_tab_bar)
-
-	const TAB_NAMES := ["Paint", "Decals", "Wheels", "Body", "Performance", "Collection"]
-	for i in range(TAB_NAMES.size()):
+	_tab_bar.add_theme_constant_override("separation", 4)
+	_left_panel.add_child(_tab_bar)
+	for name in ALL_TABS:
 		var btn := Button.new()
-		btn.text = TAB_NAMES[i]
-		btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		btn.pressed.connect(_switch_tab.bind(i))
+		btn.text = name
+		btn.toggle_mode = true
+		btn.pressed.connect(func(): _switch_tab(name))
 		_tab_bar.add_child(btn)
+		_tab_buttons[name] = btn
 
-func _build_content_area(parent: Control) -> void:
-	_content_stack = Control.new()
-	_content_stack.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	_content_stack.custom_minimum_size = Vector2(0, 400)
-	parent.add_child(_content_stack)
+	# Tab content host
+	_tab_content = PanelContainer.new()
+	_tab_content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_tab_content.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	var panel_sb := StyleBoxFlat.new()
+	panel_sb.bg_color = PANEL_BG
+	panel_sb.corner_radius_top_left = 6
+	panel_sb.corner_radius_top_right = 6
+	panel_sb.corner_radius_bottom_left = 6
+	panel_sb.corner_radius_bottom_right = 6
+	_tab_content.add_theme_stylebox_override("panel", panel_sb)
+	_left_panel.add_child(_tab_content)
 
-	_pages.clear()
-	_pages.append(_build_paint_page())
-	_pages.append(_build_decals_page())
-	_pages.append(_build_wheels_page())
-	_pages.append(_build_body_page())
-	_pages.append(_build_performance_page())
-	_pages.append(_build_collection_page())
+	# Footer: status, buy button, compare button.
+	var footer := HBoxContainer.new()
+	_left_panel.add_child(footer)
 
-	for page in _pages:
-		page.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-		_content_stack.add_child(page)
-
-func _build_action_bar(parent: Control) -> void:
-	var row := HBoxContainer.new()
-	row.add_theme_constant_override("separation", 6)
-	parent.add_child(row)
-
-	_undo_button = Button.new()
-	_undo_button.text = "↩ Undo"
-	_undo_button.pressed.connect(_on_undo)
-	row.add_child(_undo_button)
-
-	_redo_button = Button.new()
-	_redo_button.text = "↪ Redo"
-	_redo_button.pressed.connect(_on_redo)
-	row.add_child(_redo_button)
-
-	_randomise_button = Button.new()
-	_randomise_button.text = "🎲 Random"
-	_randomise_button.pressed.connect(_on_randomise)
-	row.add_child(_randomise_button)
+	_status_label = Label.new()
+	_status_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_status_label.add_theme_color_override("font_color", TEXT_MUTED)
+	footer.add_child(_status_label)
 
 	var compare_btn := Button.new()
-	compare_btn.text = "⇌ Compare"
-	compare_btn.pressed.connect(_on_toggle_comparison)
-	row.add_child(compare_btn)
+	compare_btn.text = "Capture Before"
+	compare_btn.pressed.connect(_capture_before)
+	footer.add_child(compare_btn)
+
+	var compare_btn2 := Button.new()
+	compare_btn2.text = "Capture After"
+	compare_btn2.pressed.connect(_capture_after)
+	footer.add_child(compare_btn2)
+
+	var compare_btn3 := Button.new()
+	compare_btn3.text = "Toggle Compare"
+	compare_btn3.pressed.connect(_toggle_compare)
+	footer.add_child(compare_btn3)
+
+	var buy_btn := Button.new()
+	buy_btn.text = "Purchase Configuration"
+	buy_btn.pressed.connect(_on_purchase_clicked)
+	footer.add_child(buy_btn)
+
+	# Confirm dialog
+	_confirm_dialog = ConfirmationDialog.new()
+	_confirm_dialog.title = "Confirm Purchase"
+	_confirm_dialog.dialog_hide_on_ok = true
+	_confirm_dialog.confirmed.connect(_on_confirm_dialog_confirmed)
+	_confirm_dialog.canceled.connect(_on_confirm_dialog_canceled)
+	add_child(_confirm_dialog)
+
+## -----------------------------------------------------------------------------
+## Showroom construction
+## -----------------------------------------------------------------------------
+func _build_showroom() -> void:
+	_showroom_root = Node3D.new()
+	_showroom_root.name = "ShowroomRoot"
+	_viewport.add_child(_showroom_root)
+
+	# Environment
+	var env := WorldEnvironment.new()
+	var e := Environment.new()
+	e.background_mode = Environment.BG_COLOR
+	e.background_color = Color(0.02, 0.03, 0.08)
+	e.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
+	e.ambient_light_color = Color(0.15, 0.2, 0.3)
+	e.ambient_light_energy = 0.5
+	e.fog_enabled = true
+	e.fog_light_color = Color(0.05, 0.08, 0.18)
+	e.fog_density = 0.02
+	e.glow_enabled = true
+	e.glow_intensity = 1.2
+	env.environment = e
+	_showroom_root.add_child(env)
+
+	# Floor
+	var floor := MeshInstance3D.new()
+	var floor_mesh := PlaneMesh.new()
+	floor_mesh.size = Vector2(40, 40)
+	floor.mesh = floor_mesh
+	var floor_mat := StandardMaterial3D.new()
+	floor_mat.albedo_color = Color(0.05, 0.07, 0.12)
+	floor_mat.metallic = 0.5
+	floor_mat.roughness = 0.2
+	floor.material_override = floor_mat
+	_showroom_root.add_child(floor)
+
+	# Rotating platform
+	_platform = Node3D.new()
+	_platform.name = "Platform"
+	_showroom_root.add_child(_platform)
+
+	var platform_mesh := MeshInstance3D.new()
+	var cyl := CylinderMesh.new()
+	cyl.top_radius = PLATFORM_RADIUS
+	cyl.bottom_radius = PLATFORM_RADIUS
+	cyl.height = 0.1
+	platform_mesh.mesh = cyl
+	platform_mesh.position = Vector3(0, 0.05, 0)
+	var platform_mat := StandardMaterial3D.new()
+	platform_mat.albedo_color = Color(0.12, 0.14, 0.22)
+	platform_mat.metallic = 0.8
+	platform_mat.roughness = 0.15
+	platform_mat.emission_enabled = true
+	platform_mat.emission = ACCENT_COLOR
+	platform_mat.emission_energy_multiplier = 0.25
+	platform_mesh.material_override = platform_mat
+	_platform.add_child(platform_mesh)
+
+	# Glowing ring
+	var ring := MeshInstance3D.new()
+	var tm := TorusMesh.new()
+	tm.inner_radius = PLATFORM_RADIUS - 0.08
+	tm.outer_radius = PLATFORM_RADIUS
+	ring.mesh = tm
+	var ring_mat := StandardMaterial3D.new()
+	ring_mat.albedo_color = ACCENT_COLOR
+	ring_mat.emission_enabled = true
+	ring_mat.emission = ACCENT_COLOR
+	ring_mat.emission_energy_multiplier = 3.0
+	ring.material_override = ring_mat
+	ring.rotation = Vector3(PI * 0.5, 0, 0)
+	ring.position = Vector3(0, 0.1, 0)
+	_platform.add_child(ring)
+
+	# Studio lights
+	for angle_deg in [45.0, 135.0, 225.0, 315.0]:
+		var angle: float = deg_to_rad(angle_deg)
+		var spot := SpotLight3D.new()
+		spot.light_color = Color(1.0, 0.98, 0.95) if angle_deg == 45.0 else Color(0.85, 0.9, 1.0)
+		spot.light_energy = 3.5
+		spot.spot_range = 14.0
+		spot.spot_angle = 35.0
+		spot.spot_angle_attenuation = 0.8
+		spot.position = Vector3(cos(angle) * 5.5, 5.0, sin(angle) * 5.5)
+		spot.look_at(Vector3.ZERO, Vector3.UP)
+		_showroom_root.add_child(spot)
+		_studio_lights.append(spot)
+
+	# Key rim light (magenta)
+	var rim := OmniLight3D.new()
+	rim.light_color = Color(1.0, 0.3, 1.0)
+	rim.light_energy = 2.0
+	rim.omni_range = 9.0
+	rim.position = Vector3(-4.0, 2.0, -3.5)
+	_showroom_root.add_child(rim)
+	_studio_lights.append(rim)
+
+	# Re-parent the vehicle (if any) into the platform so it rotates.
+	if _vehicle != null and _vehicle.get_parent() != _platform:
+		var original_parent := _vehicle.get_parent()
+		if original_parent != null:
+			original_parent.remove_child(_vehicle)
+		_platform.add_child(_vehicle)
+		_vehicle.position = Vector3.ZERO
+
+	# Camera rig: yaw (Y-axis) -> pitch (X-axis) -> camera offset (Z).
+	_camera_rig = Node3D.new()
+	_camera_rig.name = "CameraRig"
+	_showroom_root.add_child(_camera_rig)
+	_camera_yaw = Node3D.new()
+	_camera_rig.add_child(_camera_yaw)
+	_camera_pitch = Node3D.new()
+	_camera_yaw.add_child(_camera_pitch)
+	_camera = Camera3D.new()
+	_camera.fov = 45.0
+	_camera.near = 0.05
+	_camera.far = 200.0
+	_camera_pitch.add_child(_camera)
+	_update_camera_transform()
+
+## -----------------------------------------------------------------------------
+## Process — platform rotation + camera animation
+## -----------------------------------------------------------------------------
+func _process(delta: float) -> void:
+	if auto_rotate and _platform != null:
+		_platform_rotation += deg_to_rad(auto_rotate_speed_deg_s) * delta
+		_platform.rotation = Vector3(0, _platform_rotation, 0)
 
-	_save_button = Button.new()
-	_save_button.text = "💾 Save"
-	_save_button.pressed.connect(_on_save_config)
-	row.add_child(_save_button)
-
-func _build_status_bar(parent: Control) -> void:
-	_status_bar = Label.new()
-	_status_bar.text = "Ready."
-	_status_bar.add_theme_color_override("font_color", Color(0.7, 0.9, 0.7))
-	parent.add_child(_status_bar)
-
-# ---------------------------------------------------------------------------
-# Individual page builders
-# ---------------------------------------------------------------------------
-func _build_paint_page() -> Control:
-	var scroll := ScrollContainer.new()
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	var vbox := VBoxContainer.new()
-	scroll.add_child(vbox)
-
-	vbox.add_child(_section_label("Body Color"))
-
-	var color_row := HBoxContainer.new()
-	vbox.add_child(color_row)
-	var cl := Label.new()
-	cl.text = "Primary:"
-	color_row.add_child(cl)
-	_paint_color_picker = ColorPickerButton.new()
-	_paint_color_picker.color = Color(0.1, 0.5, 1.0)
-	_paint_color_picker.custom_minimum_size = Vector2(120, 32)
-	_paint_color_picker.color_changed.connect(_on_paint_color_changed)
-	color_row.add_child(_paint_color_picker)
-
-	var sec_row := HBoxContainer.new()
-	vbox.add_child(sec_row)
-	var sl := Label.new()
-	sl.text = "Secondary:"
-	sec_row.add_child(sl)
-	_secondary_color_picker = ColorPickerButton.new()
-	_secondary_color_picker.color = Color(0.05, 0.05, 0.05)
-	_secondary_color_picker.custom_minimum_size = Vector2(120, 32)
-	_secondary_color_picker.color_changed.connect(_on_secondary_color_changed)
-	sec_row.add_child(_secondary_color_picker)
-
-	vbox.add_child(_section_label("Paint Finish"))
-	_finish_option = OptionButton.new()
-	for finish in ["Metallic", "Matte", "Chrome", "Pearlescent", "Candy", "Satin"]:
-		_finish_option.add_item(finish)
-	_finish_option.item_selected.connect(_on_finish_selected)
-	vbox.add_child(_finish_option)
-
-	_paint_preview_rect = ColorRect.new()
-	_paint_preview_rect.custom_minimum_size = Vector2(0, 40)
-	_paint_preview_rect.color = Color(0.1, 0.5, 1.0)
-	vbox.add_child(_paint_preview_rect)
-
-	vbox.add_child(_section_label("Quick Presets"))
-	var preset_grid := GridContainer.new()
-	preset_grid.columns = 6
-	var presets := [
-		Color.RED, Color.ORANGE, Color.YELLOW, Color.GREEN,
-		Color.CYAN, Color.BLUE, Color.PURPLE, Color.MAGENTA,
-		Color.WHITE, Color.SILVER, Color.BLACK, Color(0.02, 0.02, 0.02),
-	]
-	for c in presets:
-		var swatch := ColorRect.new()
-		swatch.custom_minimum_size = Vector2(36, 36)
-		swatch.color = c
-		var btn_overlay := Button.new()
-		btn_overlay.flat = true
-		btn_overlay.pressed.connect(_on_preset_color.bind(c))
-		btn_overlay.custom_minimum_size = Vector2(36, 36)
-		var container := PanelContainer.new()
-		container.add_child(swatch)
-		container.add_child(btn_overlay)
-		preset_grid.add_child(container)
-	vbox.add_child(preset_grid)
-
-	return scroll
-
-func _build_decals_page() -> Control:
-	var scroll := ScrollContainer.new()
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	var vbox := VBoxContainer.new()
-	scroll.add_child(vbox)
-
-	vbox.add_child(_section_label("Decal Template"))
-
-	_decal_grid = GridContainer.new()
-	_decal_grid.columns = 3
-	_populate_decal_grid()
-	vbox.add_child(_decal_grid)
-
-	vbox.add_child(_section_label("Decal Color"))
-	var row := HBoxContainer.new()
-	vbox.add_child(row)
-	row.add_child(_make_label("Color:"))
-	_decal_color_picker = ColorPickerButton.new()
-	_decal_color_picker.color = Color.WHITE
-	_decal_color_picker.custom_minimum_size = Vector2(100, 30)
-	_decal_color_picker.color_changed.connect(_on_decal_color_changed)
-	row.add_child(_decal_color_picker)
-
-	var op_row := HBoxContainer.new()
-	vbox.add_child(op_row)
-	op_row.add_child(_make_label("Opacity:"))
-	_decal_opacity_slider = HSlider.new()
-	_decal_opacity_slider.min_value = 0.0
-	_decal_opacity_slider.max_value = 1.0
-	_decal_opacity_slider.value = 1.0
-	_decal_opacity_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_decal_opacity_slider.value_changed.connect(_on_decal_opacity_changed)
-	op_row.add_child(_decal_opacity_slider)
-
-	return scroll
-
-func _populate_decal_grid() -> void:
-	if _decal_grid == null:
-		return
-	for c in _decal_grid.get_children():
-		c.queue_free()
-	if customizer == null:
-		return
-	for template in customizer.DECAL_TEMPLATES:
-		var btn := Button.new()
-		btn.text = template["name"]
-		btn.custom_minimum_size = Vector2(110, 40)
-		btn.pressed.connect(_on_decal_selected.bind(template["id"]))
-		if customizer.current_config.get("decal_id", 0) == template["id"]:
-			btn.add_theme_color_override("font_color", Color(0.3, 0.8, 1.0))
-		_decal_grid.add_child(btn)
-
-func _build_wheels_page() -> Control:
-	var scroll := ScrollContainer.new()
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	var vbox := VBoxContainer.new()
-	scroll.add_child(vbox)
-
-	vbox.add_child(_section_label("Wheel Style"))
-	_wheel_grid = GridContainer.new()
-	_wheel_grid.columns = 2
-	_populate_wheel_grid()
-	vbox.add_child(_wheel_grid)
-
-	vbox.add_child(_section_label("Rim Color"))
-	var row := HBoxContainer.new()
-	vbox.add_child(row)
-	row.add_child(_make_label("Color:"))
-	_wheel_color_picker = ColorPickerButton.new()
-	_wheel_color_picker.color = Color(0.8, 0.8, 0.8)
-	_wheel_color_picker.custom_minimum_size = Vector2(100, 30)
-	_wheel_color_picker.color_changed.connect(_on_wheel_color_changed)
-	row.add_child(_wheel_color_picker)
-
-	return scroll
-
-func _populate_wheel_grid() -> void:
-	if _wheel_grid == null:
-		return
-	for c in _wheel_grid.get_children():
-		c.queue_free()
-	if customizer == null:
-		return
-	for style in customizer.WHEEL_STYLES:
-		var btn := Button.new()
-		btn.text = style["name"]
-		btn.custom_minimum_size = Vector2(160, 40)
-		btn.pressed.connect(_on_wheel_selected.bind(style["id"]))
-		if customizer.current_config.get("wheel_id", 0) == style["id"]:
-			btn.add_theme_color_override("font_color", Color(0.3, 0.8, 1.0))
-		_wheel_grid.add_child(btn)
-
-func _build_body_page() -> Control:
-	var scroll := ScrollContainer.new()
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	var vbox := VBoxContainer.new()
-	scroll.add_child(vbox)
-
-	vbox.add_child(_section_label("Spoiler"))
-	_spoiler_option = OptionButton.new()
-	if customizer:
-		for s in customizer.SPOILER_STYLES:
-			_spoiler_option.add_item(s["name"])
-	_spoiler_option.item_selected.connect(_on_spoiler_selected)
-	vbox.add_child(_spoiler_option)
-
-	vbox.add_child(_section_label("Exhaust"))
-	_exhaust_option = OptionButton.new()
-	if customizer:
-		for e in customizer.EXHAUST_STYLES:
-			_exhaust_option.add_item(e["name"])
-	_exhaust_option.item_selected.connect(_on_exhaust_selected)
-	vbox.add_child(_exhaust_option)
-
-	vbox.add_child(_section_label("Underglow"))
-	var ug_row := HBoxContainer.new()
-	vbox.add_child(ug_row)
-	_underglow_check = CheckButton.new()
-	_underglow_check.text = "Enable Underglow"
-	_underglow_check.toggled.connect(_on_underglow_toggled)
-	ug_row.add_child(_underglow_check)
-
-	var ug_color_row := HBoxContainer.new()
-	vbox.add_child(ug_color_row)
-	ug_color_row.add_child(_make_label("Color:"))
-	_underglow_color_picker = ColorPickerButton.new()
-	_underglow_color_picker.color = Color(0, 1, 1)
-	_underglow_color_picker.custom_minimum_size = Vector2(100, 30)
-	_underglow_color_picker.color_changed.connect(_on_underglow_color_changed)
-	ug_color_row.add_child(_underglow_color_picker)
-
-	var ug_int_row := HBoxContainer.new()
-	vbox.add_child(ug_int_row)
-	ug_int_row.add_child(_make_label("Intensity:"))
-	_underglow_intensity_slider = HSlider.new()
-	_underglow_intensity_slider.min_value = 0.5
-	_underglow_intensity_slider.max_value = 6.0
-	_underglow_intensity_slider.value = 2.0
-	_underglow_intensity_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_underglow_intensity_slider.value_changed.connect(_on_underglow_intensity_changed)
-	ug_int_row.add_child(_underglow_intensity_slider)
-
-	vbox.add_child(_section_label("Window Tint"))
-	var tint_row := HBoxContainer.new()
-	vbox.add_child(tint_row)
-	tint_row.add_child(_make_label("Opacity:"))
-	_window_tint_slider = HSlider.new()
-	_window_tint_slider.min_value = 0.0
-	_window_tint_slider.max_value = 0.9
-	_window_tint_slider.value = 0.0
-	_window_tint_slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_window_tint_slider.value_changed.connect(_on_tint_opacity_changed)
-	tint_row.add_child(_window_tint_slider)
-
-	var tint_color_row := HBoxContainer.new()
-	vbox.add_child(tint_color_row)
-	tint_color_row.add_child(_make_label("Tint:"))
-	_tint_color_picker = ColorPickerButton.new()
-	_tint_color_picker.color = Color(0, 0, 0)
-	_tint_color_picker.custom_minimum_size = Vector2(100, 30)
-	_tint_color_picker.color_changed.connect(_on_tint_color_changed)
-	tint_color_row.add_child(_tint_color_picker)
-
-	vbox.add_child(_section_label("License Plate"))
-	_plate_input = LineEdit.new()
-	_plate_input.placeholder_text = "QUANT01"
-	_plate_input.max_length = 8
-	_plate_input.text_submitted.connect(_on_plate_submitted)
-	vbox.add_child(_plate_input)
-
-	return scroll
-
-func _build_performance_page() -> Control:
-	var scroll := ScrollContainer.new()
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	var vbox := VBoxContainer.new()
-	scroll.add_child(vbox)
-
-	_token_balance_label = Label.new()
-	_token_balance_label.text = "Balance: 0 QUANT"
-	_token_balance_label.add_theme_color_override("font_color", Color(1.0, 0.85, 0.0))
-	vbox.add_child(_token_balance_label)
-
-	_spider_chart_container = Control.new()
-	_spider_chart_container.custom_minimum_size = Vector2(220, 220)
-	vbox.add_child(_spider_chart_container)
-
-	_upgrade_panels.clear()
-	for cat in ["engine", "brakes", "suspension", "nitro", "turbo", "tires"]:
-		var panel := _build_upgrade_category_panel(cat)
-		vbox.add_child(panel)
-		_upgrade_panels[cat] = panel
-
-	return scroll
-
-func _build_upgrade_category_panel(category: String) -> PanelContainer:
-	var panel := PanelContainer.new()
-	var vbox := VBoxContainer.new()
-	panel.add_child(vbox)
-
-	if upgrades == null:
-		return panel
-
-	var data: Dictionary = upgrades.UPGRADE_DATA.get(category, {})
-	var header := Label.new()
-	header.text = data.get("display_name", category.capitalize())
-	header.add_theme_color_override("font_color", Color(0.9, 0.9, 1.0))
-	vbox.add_child(header)
-
-	var tier_row := HBoxContainer.new()
-	tier_row.add_theme_constant_override("separation", 4)
-	vbox.add_child(tier_row)
-
-	for tier in range(4):
-		var tier_btn := Button.new()
-		var tier_data: Dictionary = data.get(tier, {})
-		var tier_name: String = upgrades.TIER_NAMES[tier]
-		var cost: int = tier_data.get("cost", 0)
-		tier_btn.text = "%s\n%d ⬡" % [tier_name, cost]
-		tier_btn.custom_minimum_size = Vector2(80, 50)
-		tier_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-
-		var owned := upgrades.get_owned_tier(category)
-		var equipped := upgrades.get_equipped_tier(category)
-
-		if tier <= owned:
-			tier_btn.add_theme_color_override("font_color", upgrades.TIER_COLORS[tier])
-		if tier == equipped:
-			tier_btn.add_theme_stylebox_override("normal", _make_highlight_style())
-
-		tier_btn.pressed.connect(_on_upgrade_tier_pressed.bind(category, tier))
-		tier_btn.tooltip_text = tier_data.get("description", "")
-		tier_row.add_child(tier_btn)
-
-	return panel
-
-func _rebuild_performance_page() -> void:
-	for cat in _upgrade_panels.keys():
-		var old_panel = _upgrade_panels[cat]
-		if is_instance_valid(old_panel):
-			old_panel.queue_free()
-	_upgrade_panels.clear()
-
-	var perf_page: ScrollContainer = _pages[4] as ScrollContainer
-	if perf_page == null:
-		return
-	var vbox := perf_page.get_child(0) as VBoxContainer
-	if vbox == null:
-		return
-
-	for cat in ["engine", "brakes", "suspension", "nitro", "turbo", "tires"]:
-		var panel := _build_upgrade_category_panel(cat)
-		vbox.add_child(panel)
-		_upgrade_panels[cat] = panel
-
-	if upgrades and _spider_chart_container:
-		upgrades.create_spider_chart(_spider_chart_container)
-
-func _build_collection_page() -> Control:
-	var scroll := ScrollContainer.new()
-	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
-	var vbox := VBoxContainer.new()
-	scroll.add_child(vbox)
-
-	vbox.add_child(_section_label("My Vehicles & Configs"))
-
-	_collection_grid = GridContainer.new()
-	_collection_grid.columns = 2
-	vbox.add_child(_collection_grid)
-
-	_collection_detail_panel = PanelContainer.new()
-	_collection_detail_panel.custom_minimum_size = Vector2(0, 120)
-	_collection_detail_panel.visible = false
-	vbox.add_child(_collection_detail_panel)
-
-	var load_btn := Button.new()
-	load_btn.text = "↻ Refresh Collection"
-	load_btn.pressed.connect(_load_collection)
-	vbox.add_child(load_btn)
-
-	return scroll
-
-func _build_purchase_dialog() -> void:
-	_purchase_dialog = AcceptDialog.new()
-	_purchase_dialog.title = "Confirm Purchase"
-	_purchase_dialog.dialog_text = "Are you sure?"
-	_purchase_dialog.add_cancel_button("Cancel")
-	_purchase_dialog.confirmed.connect(_on_purchase_confirmed)
-	_root_control.add_child(_purchase_dialog)
-
-# ---------------------------------------------------------------------------
-# Tab switching
-# ---------------------------------------------------------------------------
-func _switch_tab(index: int) -> void:
-	_tab_index = index
-	for i in range(_pages.size()):
-		_pages[i].visible = (i == index)
-	for i in range(_tab_bar.get_child_count()):
-		var btn := _tab_bar.get_child(i) as Button
-		if btn:
-			btn.add_theme_color_override("font_color",
-				Color(0.3, 0.8, 1.0) if i == index else Color(0.8, 0.8, 0.8))
-
-	if index == 5:
-		_refresh_collection_grid()
-	if index == 4 and upgrades:
-		upgrades.refresh_spider_chart()
-
-# ---------------------------------------------------------------------------
-# Paint callbacks
-# ---------------------------------------------------------------------------
-func _on_paint_color_changed(color: Color) -> void:
-	if _paint_preview_rect:
-		_paint_preview_rect.color = color
-	if customizer:
-		var finish := customizer.ALL_FINISHES[_finish_option.selected if _finish_option else 0]
-		customizer.set_paint_color(color, finish)
-	_set_status("Paint color updated.")
-
-func _on_secondary_color_changed(color: Color) -> void:
-	if customizer:
-		customizer.set_secondary_color(color)
-
-func _on_finish_selected(index: int) -> void:
-	if customizer == null:
-		return
-	var finish := customizer.ALL_FINISHES[index]
-	var color: Color = customizer.current_config["paint_color"]
-	customizer.set_paint_color(color, finish)
-	_set_status("Finish: " + customizer.get_finish_display_name(finish))
-
-func _on_preset_color(color: Color) -> void:
-	if _paint_color_picker:
-		_paint_color_picker.color = color
-	if _paint_preview_rect:
-		_paint_preview_rect.color = color
-	if customizer:
-		var finish := customizer.ALL_FINISHES[_finish_option.selected if _finish_option else 0]
-		customizer.set_paint_color(color, finish)
-
-# ---------------------------------------------------------------------------
-# Decal callbacks
-# ---------------------------------------------------------------------------
-func _on_decal_selected(decal_id: int) -> void:
-	if customizer == null:
-		return
-	var color: Color = _decal_color_picker.color if _decal_color_picker else Color.WHITE
-	var opacity: float = _decal_opacity_slider.value if _decal_opacity_slider else 1.0
-	customizer.set_decal(decal_id, color, opacity)
-	_set_status("Decal: " + customizer.get_decal_name(decal_id))
-
-func _on_decal_color_changed(color: Color) -> void:
-	if customizer == null:
-		return
-	var id := customizer.current_config.get("decal_id", 0)
-	var opacity := _decal_opacity_slider.value if _decal_opacity_slider else 1.0
-	customizer.set_decal(id, color, opacity)
-
-func _on_decal_opacity_changed(value: float) -> void:
-	if customizer == null:
-		return
-	var id := customizer.current_config.get("decal_id", 0)
-	var color := _decal_color_picker.color if _decal_color_picker else Color.WHITE
-	customizer.set_decal(id, color, value)
-
-# ---------------------------------------------------------------------------
-# Wheel callbacks
-# ---------------------------------------------------------------------------
-func _on_wheel_selected(style_id: int) -> void:
-	if customizer == null:
-		return
-	var color: Color = _wheel_color_picker.color if _wheel_color_picker else Color(0.8, 0.8, 0.8)
-	customizer.set_wheel_style(style_id, color)
-	_set_status("Wheels: " + customizer.get_wheel_name(style_id))
-
-func _on_wheel_color_changed(color: Color) -> void:
-	if customizer == null:
-		return
-	var id := customizer.current_config.get("wheel_id", 0)
-	customizer.set_wheel_style(id, color)
-
-# ---------------------------------------------------------------------------
-# Body callbacks
-# ---------------------------------------------------------------------------
-func _on_spoiler_selected(index: int) -> void:
-	if customizer:
-		customizer.set_spoiler(index)
-		_set_status("Spoiler: " + customizer.get_spoiler_name(index))
-
-func _on_exhaust_selected(index: int) -> void:
-	if customizer:
-		customizer.set_exhaust(index)
-		_set_status("Exhaust: " + customizer.get_exhaust_name(index))
-
-func _on_underglow_toggled(state: bool) -> void:
-	if customizer == null:
-		return
-	var color := _underglow_color_picker.color if _underglow_color_picker else Color(0, 1, 1)
-	var intensity := _underglow_intensity_slider.value if _underglow_intensity_slider else 2.0
-	customizer.set_underglow(state, color, intensity)
-	_set_status("Underglow: " + ("ON" if state else "OFF"))
-
-func _on_underglow_color_changed(color: Color) -> void:
-	if customizer == null:
-		return
-	var enabled := _underglow_check.button_pressed if _underglow_check else false
-	var intensity := _underglow_intensity_slider.value if _underglow_intensity_slider else 2.0
-	customizer.set_underglow(enabled, color, intensity)
-
-func _on_underglow_intensity_changed(value: float) -> void:
-	if customizer == null:
-		return
-	var enabled := _underglow_check.button_pressed if _underglow_check else false
-	var color := _underglow_color_picker.color if _underglow_color_picker else Color(0, 1, 1)
-	customizer.set_underglow(enabled, color, value)
-
-func _on_tint_opacity_changed(value: float) -> void:
-	if customizer == null:
-		return
-	var color := _tint_color_picker.color if _tint_color_picker else Color.BLACK
-	customizer.set_window_tint(value, color)
-
-func _on_tint_color_changed(color: Color) -> void:
-	if customizer == null:
-		return
-	var opacity := _window_tint_slider.value if _window_tint_slider else 0.0
-	customizer.set_window_tint(opacity, color)
-
-func _on_plate_submitted(text: String) -> void:
-	if customizer:
-		customizer.set_license_plate(text.strip_edges().to_upper())
-		_set_status("Plate set: " + text.strip_edges().to_upper())
-
-# ---------------------------------------------------------------------------
-# Performance callbacks
-# ---------------------------------------------------------------------------
-func _on_upgrade_tier_pressed(category: String, tier: int) -> void:
-	if upgrades == null:
-		return
-	var owned := upgrades.get_owned_tier(category)
-	if tier <= owned:
-		upgrades.equip_upgrade(category, tier)
-		_set_status("Equipped: " + upgrades.UPGRADE_DATA[category].get("display_name", category) + " Tier " + upgrades.TIER_NAMES[tier])
-		_rebuild_performance_page()
-		return
-
-	var cost := upgrades.get_upgrade_cost(category, tier)
-	var desc := upgrades.get_upgrade_description(category, tier)
-	_pending_purchase = {"category": category, "tier": tier, "cost": cost}
-	_purchase_dialog.dialog_text = "Purchase %s %s for %d QUANT?\n\n%s" % [
-		upgrades.UPGRADE_DATA[category].get("display_name", category),
-		upgrades.TIER_NAMES[tier],
-		cost,
-		desc,
-	]
-	_purchase_dialog.popup_centered()
-
-func _on_purchase_confirmed() -> void:
-	if upgrades == null or _pending_purchase.is_empty():
-		return
-	var cat: String = _pending_purchase["category"]
-	var tier: int = _pending_purchase["tier"]
-	if upgrades.purchase_upgrade(cat, tier):
-		_set_status("Purchased %s %s!" % [upgrades.UPGRADE_DATA[cat].get("display_name", cat), upgrades.TIER_NAMES[tier]])
-		_rebuild_performance_page()
-		_update_balance_label()
-		emit_signal("config_purchase_confirmed", upgrades.equipped_tiers, _pending_purchase["cost"])
-	else:
-		_set_status("Purchase failed — insufficient QUANT tokens.")
-	_pending_purchase = {}
-
-# ---------------------------------------------------------------------------
-# Comparison
-# ---------------------------------------------------------------------------
-func _on_toggle_comparison() -> void:
-	_comparison_active = not _comparison_active
-	_comparison_container.visible = _comparison_active
-	if _comparison_active and customizer:
-		_set_status("Comparison mode ON — drag slider to blend before/after.")
-	else:
-		_set_status("Comparison mode OFF.")
-
-func _on_comparison_slider_changed(value: float) -> void:
-	_comparison_value = value
-	if customizer == null:
-		return
-	if value < 0.5:
-		customizer.restore_before()
-	else:
-		customizer.apply_config(customizer.current_config)
-
-func _on_show_before() -> void:
-	if customizer:
-		customizer.restore_before()
-	if _comparison_slider:
-		_comparison_slider.value = 0.0
-
-func _on_show_after() -> void:
-	if _comparison_slider:
-		_comparison_slider.value = 1.0
-
-# ---------------------------------------------------------------------------
-# Undo / Redo / Randomise / Save
-# ---------------------------------------------------------------------------
-func _on_undo() -> void:
-	if customizer and customizer.can_undo():
-		customizer.undo()
-		_sync_ui_from_config(customizer.current_config)
-		_set_status("Undo applied.")
-	else:
-		_set_status("Nothing to undo.")
-
-func _on_redo() -> void:
-	if customizer and customizer.can_redo():
-		customizer.redo()
-		_sync_ui_from_config(customizer.current_config)
-		_set_status("Redo applied.")
-	else:
-		_set_status("Nothing to redo.")
-
-func _on_randomise() -> void:
-	if customizer == null:
-		return
-	customizer.randomise_all()
-	_sync_ui_from_config(customizer.current_config)
-	_set_status("Random config applied!")
-
-func _on_save_config() -> void:
-	if customizer == null:
-		return
-	var dialog := AcceptDialog.new()
-	dialog.title = "Save Configuration"
-	var input := LineEdit.new()
-	input.placeholder_text = "Config name..."
-	dialog.add_child(input)
-	dialog.confirmed.connect(func():
-		var name := input.text.strip_edges()
-		if name == "":
-			name = "My Config"
-		var id := customizer.save_config(name)
-		_set_status("Config saved as: " + id)
-		_refresh_collection_grid()
-	)
-	_root_control.add_child(dialog)
-	dialog.popup_centered_ratio(0.4)
-
-# ---------------------------------------------------------------------------
-# Camera orbit
-# ---------------------------------------------------------------------------
 func _update_camera_transform() -> void:
-	if _garage_camera == null:
+	if _camera == null or _camera_yaw == null or _camera_pitch == null:
 		return
-	var yaw_rad := deg_to_rad(_orbit_yaw)
-	var pitch_rad := deg_to_rad(_orbit_pitch)
-	var offset := Vector3(
-		sin(yaw_rad) * cos(pitch_rad),
-		sin(pitch_rad),
-		cos(yaw_rad) * cos(pitch_rad)
-	) * _orbit_distance
-	_garage_camera.global_position = _orbit_target + offset
-	_garage_camera.look_at(_orbit_target, Vector3.UP)
+	_camera_yaw.rotation = Vector3(0, _camera_yaw_rad, 0)
+	_camera_pitch.rotation = Vector3(-_camera_pitch_rad, 0, 0)
+	_camera.position = Vector3(0, 0, _camera_distance)
 
-func _reset_camera() -> void:
-	_orbit_yaw = 0.0
-	_orbit_pitch = 15.0
-	_orbit_distance = 6.0
-	if _zoom_slider:
-		_zoom_slider.value = _orbit_distance
-
-func _on_auto_spin_toggled(state: bool) -> void:
-	_auto_rotate = state
-
-func _on_zoom_changed(value: float) -> void:
-	_orbit_distance = value
-
-func _input(event: InputEvent) -> void:
-	if not _is_open:
-		return
+## -----------------------------------------------------------------------------
+## Viewport input — orbit / zoom / drag-to-pause-rotation
+## -----------------------------------------------------------------------------
+func _on_viewport_gui_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
-		if event.button_index == MOUSE_BUTTON_LEFT:
-			_orbit_dragging = event.pressed
-			_drag_last = event.position
-		elif event.button_index == MOUSE_BUTTON_WHEEL_UP:
-			_orbit_distance = maxf(2.0, _orbit_distance - 0.4)
-			if _zoom_slider:
-				_zoom_slider.value = _orbit_distance
-		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN:
-			_orbit_distance = minf(12.0, _orbit_distance + 0.4)
-			if _zoom_slider:
-				_zoom_slider.value = _orbit_distance
-	elif event is InputEventMouseMotion and _orbit_dragging:
-		var delta_v: Vector2 = event.position - _drag_last
-		_orbit_yaw   -= delta_v.x * 0.4
-		_orbit_pitch  = clampf(_orbit_pitch + delta_v.y * 0.3, -30.0, 60.0)
-		_drag_last = event.position
-		_auto_rotate = false
-		if _spin_toggle:
-			_spin_toggle.button_pressed = false
+		var mb := event as InputEventMouseButton
+		if mb.button_index == MOUSE_BUTTON_LEFT:
+			_dragging = mb.pressed
+			if mb.pressed:
+				auto_rotate = false
+		elif mb.button_index == MOUSE_BUTTON_WHEEL_UP and mb.pressed:
+			_camera_distance = clamp(_camera_distance - 0.4, CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE)
+			_update_camera_transform()
+		elif mb.button_index == MOUSE_BUTTON_WHEEL_DOWN and mb.pressed:
+			_camera_distance = clamp(_camera_distance + 0.4, CAMERA_MIN_DISTANCE, CAMERA_MAX_DISTANCE)
+			_update_camera_transform()
+	elif event is InputEventMouseMotion and _dragging:
+		var mm := event as InputEventMouseMotion
+		_camera_yaw_rad -= mm.relative.x * 0.008
+		_camera_pitch_rad = clamp(_camera_pitch_rad + mm.relative.y * 0.006, CAMERA_MIN_PITCH, CAMERA_MAX_PITCH)
+		_update_camera_transform()
+	elif event is InputEventKey:
+		var k := event as InputEventKey
+		if k.pressed and k.keycode == KEY_R:
+			auto_rotate = not auto_rotate
 
-# ---------------------------------------------------------------------------
-# Collection
-# ---------------------------------------------------------------------------
-func _load_collection() -> void:
-	_collection_vehicles.clear()
-	if customizer == null:
+## -----------------------------------------------------------------------------
+## Tabs
+## -----------------------------------------------------------------------------
+func _switch_tab(tab_name: String) -> void:
+	if not (tab_name in ALL_TABS):
 		return
-	customizer.load_persisted_configs()
-	for id in customizer.get_saved_config_ids():
-		var conf := customizer.get_config_preview(id)
-		_collection_vehicles.append({"id": id, "config": conf})
-	_refresh_collection_grid()
-
-func _refresh_collection_grid() -> void:
-	if _collection_grid == null:
-		return
-	for c in _collection_grid.get_children():
+	_current_tab = tab_name
+	for n in _tab_buttons.keys():
+		var b: Button = _tab_buttons[n]
+		b.button_pressed = (n == tab_name)
+	# Wipe content
+	for c in _tab_content.get_children():
 		c.queue_free()
+	var body: Control = null
+	match tab_name:
+		TAB_PAINT: body = _build_paint_panel()
+		TAB_DECALS: body = _build_decals_panel()
+		TAB_WHEELS: body = _build_wheels_panel()
+		TAB_SPOILER: body = _build_spoiler_panel()
+		TAB_EXHAUST: body = _build_exhaust_panel()
+		TAB_UNDERGLOW: body = _build_underglow_panel()
+		TAB_PERFORMANCE: body = _build_performance_panel()
+		TAB_COLLECTION: body = _build_collection_panel()
+		TAB_MARKETPLACE: body = _build_marketplace_panel()
+	if body != null:
+		_tab_content.add_child(body)
+	emit_signal("tab_changed", tab_name)
 
-	if customizer == null:
-		return
+## ---------------------------- Paint panel ------------------------------------
+func _build_paint_panel() -> Control:
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 10)
 
-	for i in range(_collection_vehicles.size()):
-		var entry: Dictionary = _collection_vehicles[i]
-		var card := _build_collection_card(entry, i)
-		_collection_grid.add_child(card)
+	var color_label := Label.new()
+	color_label.text = "Body Color (HSV)"
+	v.add_child(color_label)
 
-	if _collection_vehicles.is_empty():
-		var empty_lbl := Label.new()
-		empty_lbl.text = "No saved configurations.\nCustomize and save your ride!"
-		_collection_grid.add_child(empty_lbl)
+	var picker := ColorPicker.new()
+	picker.color = _customizer.paint_color if _customizer else Color(0.9, 0.1, 0.1)
+	picker.edit_alpha = false
+	picker.color_changed.connect(func(c):
+		if _customizer:
+			_customizer.set_paint(c, _customizer.paint_finish)
+			_refresh_status())
+	v.add_child(picker)
 
-func _build_collection_card(entry: Dictionary, index: int) -> PanelContainer:
-	var card := PanelContainer.new()
-	card.custom_minimum_size = Vector2(160, 80)
-	var vbox := VBoxContainer.new()
-	card.add_child(vbox)
+	var finish_label := Label.new()
+	finish_label.text = "Finish"
+	v.add_child(finish_label)
 
-	var name_lbl := Label.new()
-	name_lbl.text = entry["id"].replace("_", " ").capitalize()
-	name_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	vbox.add_child(name_lbl)
+	var finishes := HBoxContainer.new()
+	v.add_child(finishes)
+	var finish_options := ["metallic", "matte", "chrome", "pearlescent"]
+	for f in finish_options:
+		var btn := Button.new()
+		btn.text = f.capitalize()
+		btn.toggle_mode = true
+		if _customizer and _customizer.paint_finish == f:
+			btn.button_pressed = true
+		btn.pressed.connect(func():
+			if _customizer:
+				_customizer.set_paint_finish(f)
+				_switch_tab(TAB_PAINT))
+		finishes.add_child(btn)
 
-	var color_rect := ColorRect.new()
-	color_rect.custom_minimum_size = Vector2(0, 20)
-	var conf: Dictionary = entry.get("config", {})
-	color_rect.color = conf.get("paint_color", Color(0.5, 0.5, 0.5))
-	vbox.add_child(color_rect)
+	var pearl_label := Label.new()
+	pearl_label.text = "Pearlescent shift color"
+	v.add_child(pearl_label)
 
-	var row := HBoxContainer.new()
-	vbox.add_child(row)
+	var pearl_picker := ColorPicker.new()
+	pearl_picker.color = _customizer.paint_pearl_shift if _customizer else Color(0.2, 0.4, 1.0)
+	pearl_picker.edit_alpha = false
+	pearl_picker.color_changed.connect(func(c):
+		if _customizer:
+			_customizer.set_pearl_shift(c))
+	v.add_child(pearl_picker)
+	return _wrap_scroll(v)
 
-	var load_btn := Button.new()
-	load_btn.text = "Load"
-	load_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	load_btn.pressed.connect(_on_load_collection_entry.bind(entry["id"]))
-	row.add_child(load_btn)
+## ---------------------------- Decals panel -----------------------------------
+func _build_decals_panel() -> Control:
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 6)
 
-	var del_btn := Button.new()
-	del_btn.text = "🗑"
-	del_btn.pressed.connect(_on_delete_collection_entry.bind(entry["id"]))
-	row.add_child(del_btn)
+	var slot_row := HBoxContainer.new()
+	var slot_label := Label.new()
+	slot_label.text = "Target Slot"
+	slot_row.add_child(slot_label)
+	var slot_option := OptionButton.new()
+	slot_option.name = "SlotOption"
+	for i in range(6):
+		slot_option.add_item(_decal_slot_name(i), i)
+	slot_row.add_child(slot_option)
+	var remove_btn := Button.new()
+	remove_btn.text = "Remove From Slot"
+	remove_btn.pressed.connect(func():
+		if _customizer:
+			_customizer.remove_decal(slot_option.get_selected_id())
+			_refresh_status())
+	slot_row.add_child(remove_btn)
+	var clear_btn := Button.new()
+	clear_btn.text = "Clear All"
+	clear_btn.pressed.connect(func():
+		if _customizer:
+			_customizer.clear_all_decals()
+			_refresh_status())
+	slot_row.add_child(clear_btn)
+	v.add_child(slot_row)
 
-	return card
+	# Category filter
+	var cat_row := HBoxContainer.new()
+	var cat_label := Label.new()
+	cat_label.text = "Category"
+	cat_row.add_child(cat_label)
+	var cat_option := OptionButton.new()
+	cat_option.add_item("All", 0)
+	var categories: Array = []
+	if _customizer:
+		for id in _customizer.DECAL_CATALOGUE.keys():
+			var c = _customizer.DECAL_CATALOGUE[id].get("category", "")
+			if not (c in categories):
+				categories.append(c)
+	for i in range(categories.size()):
+		cat_option.add_item(categories[i], i + 1)
+	cat_row.add_child(cat_option)
+	v.add_child(cat_row)
 
-func _on_load_collection_entry(config_id: String) -> void:
-	if customizer:
-		customizer.load_config(config_id)
-		_sync_ui_from_config(customizer.current_config)
-		_set_status("Loaded config: " + config_id)
-		_switch_tab(0)
+	# Scrollable grid of decal buttons
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.custom_minimum_size = Vector2(0, 320)
+	var grid := GridContainer.new()
+	grid.columns = 3
+	scroll.add_child(grid)
+	v.add_child(scroll)
 
-func _on_delete_collection_entry(config_id: String) -> void:
-	if customizer:
-		customizer.delete_config(config_id)
-		_load_collection()
-		_set_status("Deleted: " + config_id)
+	var _populate_decal_grid = func():
+		for c in grid.get_children():
+			c.queue_free()
+		if _customizer == null:
+			return
+		var selected_cat_id: int = cat_option.get_selected_id()
+		var cat_name: String = "" if selected_cat_id == 0 else String(cat_option.get_item_text(cat_option.get_item_index(selected_cat_id)))
+		for decal_id in _customizer.DECAL_CATALOGUE.keys():
+			var info: Dictionary = _customizer.DECAL_CATALOGUE[decal_id]
+			if cat_name != "" and info.get("category", "") != cat_name:
+				continue
+			var btn := Button.new()
+			btn.text = "%s\n%s · %d QNT" % [info.get("name", decal_id), info.get("rarity", ""), int(info.get("price", 0))]
+			btn.custom_minimum_size = Vector2(150, 60)
+			btn.pressed.connect(func():
+				_customizer.apply_decal(slot_option.get_selected_id(), decal_id)
+				_refresh_status())
+			grid.add_child(btn)
+	cat_option.item_selected.connect(func(_i): _populate_decal_grid.call())
+	_populate_decal_grid.call()
+	return v
 
-# ---------------------------------------------------------------------------
-# Sync UI from config
-# ---------------------------------------------------------------------------
-func _sync_ui_from_config(conf: Dictionary) -> void:
-	if _paint_color_picker:
-		_paint_color_picker.color = conf.get("paint_color", Color(0.1, 0.5, 1.0))
-	if _paint_preview_rect:
-		_paint_preview_rect.color = conf.get("paint_color", Color(0.1, 0.5, 1.0))
-	if _secondary_color_picker:
-		_secondary_color_picker.color = conf.get("secondary_color", Color(0.05, 0.05, 0.05))
-	if _finish_option and customizer:
-		var finish: String = conf.get("paint_finish", "metallic")
-		var idx := customizer.ALL_FINISHES.find(finish)
-		if idx >= 0:
-			_finish_option.select(idx)
-	if _decal_color_picker:
-		_decal_color_picker.color = conf.get("decal_color", Color.WHITE)
-	if _decal_opacity_slider:
-		_decal_opacity_slider.value = conf.get("decal_opacity", 1.0)
-	if _wheel_color_picker:
-		_wheel_color_picker.color = conf.get("wheel_color", Color(0.8, 0.8, 0.8))
-	if _underglow_check:
-		_underglow_check.button_pressed = conf.get("underglow_enabled", false)
-	if _underglow_color_picker:
-		_underglow_color_picker.color = conf.get("underglow_color", Color(0, 1, 1))
-	if _underglow_intensity_slider:
-		_underglow_intensity_slider.value = conf.get("underglow_intensity", 2.0)
-	if _window_tint_slider:
-		_window_tint_slider.value = conf.get("tint_opacity", 0.0)
-	if _plate_input:
-		_plate_input.text = conf.get("license_plate", "QUANT01")
+func _decal_slot_name(slot: int) -> String:
+	match slot:
+		0: return "Hood"
+		1: return "Roof"
+		2: return "Trunk"
+		3: return "Left Door"
+		4: return "Right Door"
+		5: return "Rear Window"
+	return "Slot " + str(slot)
 
-# ---------------------------------------------------------------------------
-# Status / balance helpers
-# ---------------------------------------------------------------------------
-func _set_status(msg: String) -> void:
-	if _status_bar:
-		_status_bar.text = msg
+## ---------------------------- Wheels panel -----------------------------------
+func _build_wheels_panel() -> Control:
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 6)
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.custom_minimum_size = Vector2(0, 360)
+	var grid := GridContainer.new()
+	grid.columns = 2
+	scroll.add_child(grid)
+	v.add_child(scroll)
+	if _customizer:
+		for id in _customizer.WHEEL_CATALOGUE.keys():
+			var info: Dictionary = _customizer.WHEEL_CATALOGUE[id]
+			var btn := Button.new()
+			btn.text = "%s\n%s · %d QNT" % [info.get("name", id), info.get("rarity", ""), int(info.get("price", 0))]
+			btn.custom_minimum_size = Vector2(220, 60)
+			btn.pressed.connect(func():
+				_customizer.set_wheels(id)
+				_refresh_status())
+			grid.add_child(btn)
+	return v
 
-func set_token_balance(balance: int) -> void:
-	if _balance_label:
-		_balance_label.text = "⬡ %d QUANT" % balance
-	if _token_balance_label:
-		_token_balance_label.text = "Balance: %d QUANT" % balance
-	if upgrades:
-		upgrades.set_player_balance(balance)
+## ---------------------------- Spoiler panel ----------------------------------
+func _build_spoiler_panel() -> Control:
+	var v := VBoxContainer.new()
+	if _customizer:
+		for id in _customizer.SPOILER_CATALOGUE.keys():
+			var info: Dictionary = _customizer.SPOILER_CATALOGUE[id]
+			var btn := Button.new()
+			btn.text = "%s — downforce %.2f · drag %.2f · %d QNT" % [
+				info.get("name", id),
+				float(info.get("downforce", 0.0)),
+				float(info.get("drag", 0.0)),
+				int(info.get("price", 0)),
+			]
+			btn.pressed.connect(func():
+				_customizer.set_spoiler(id)
+				_refresh_status())
+			v.add_child(btn)
+	return _wrap_scroll(v)
 
-func _update_balance_label() -> void:
-	if upgrades == null:
-		return
-	set_token_balance(upgrades.player_token_balance)
+## ---------------------------- Exhaust panel ----------------------------------
+func _build_exhaust_panel() -> Control:
+	var v := VBoxContainer.new()
+	if _customizer:
+		for id in _customizer.EXHAUST_CATALOGUE.keys():
+			var info: Dictionary = _customizer.EXHAUST_CATALOGUE[id]
+			var btn := Button.new()
+			btn.text = "%s — %d tip(s) · %s · %d dB · %d QNT" % [
+				info.get("name", id),
+				int(info.get("tip_count", 1)),
+				String(info.get("tone", "")),
+				int(info.get("db", 0)),
+				int(info.get("price", 0)),
+			]
+			btn.pressed.connect(func():
+				_customizer.set_exhaust(id)
+				_refresh_status())
+			v.add_child(btn)
+	return _wrap_scroll(v)
 
-# ---------------------------------------------------------------------------
-# Helper constructors
-# ---------------------------------------------------------------------------
-func _section_label(text: String) -> Label:
+## ---------------------------- Underglow panel --------------------------------
+func _build_underglow_panel() -> Control:
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 8)
 	var lbl := Label.new()
-	lbl.text = "— " + text + " —"
-	lbl.add_theme_color_override("font_color", Color(0.5, 0.8, 1.0))
-	return lbl
+	lbl.text = "Underglow Color"
+	v.add_child(lbl)
+	var picker := ColorPicker.new()
+	picker.color = _customizer.underglow_color if _customizer else Color(0.1, 0.6, 1.0)
+	picker.edit_alpha = false
+	picker.color_changed.connect(func(c):
+		if _customizer:
+			_customizer.set_underglow(c, _customizer.underglow_pattern, _customizer.underglow_intensity))
+	v.add_child(picker)
 
-func _make_label(text: String) -> Label:
-	var lbl := Label.new()
-	lbl.text = text
-	return lbl
+	var pat_row := HBoxContainer.new()
+	v.add_child(pat_row)
+	var patterns = ["off", "solid", "pulse", "strobe", "chase", "rainbow"]
+	for p in patterns:
+		var btn := Button.new()
+		btn.text = p.capitalize()
+		btn.toggle_mode = true
+		if _customizer and _customizer.underglow_pattern == p:
+			btn.button_pressed = true
+		btn.pressed.connect(func():
+			if _customizer:
+				_customizer.set_underglow(_customizer.underglow_color, p, _customizer.underglow_intensity)
+				_switch_tab(TAB_UNDERGLOW))
+		pat_row.add_child(btn)
 
-func _make_highlight_style() -> StyleBoxFlat:
-	var style := StyleBoxFlat.new()
-	style.bg_color = Color(0.2, 0.5, 0.8, 0.4)
-	style.border_color = Color(0.3, 0.7, 1.0)
-	style.set_border_width_all(2)
-	style.set_corner_radius_all(4)
-	return style
+	var slider_label := Label.new()
+	slider_label.text = "Intensity"
+	v.add_child(slider_label)
+	var intensity := HSlider.new()
+	intensity.min_value = 0.0
+	intensity.max_value = 3.0
+	intensity.step = 0.05
+	intensity.value = _customizer.underglow_intensity if _customizer else 1.0
+	intensity.value_changed.connect(func(val):
+		if _customizer:
+			_customizer.set_underglow(_customizer.underglow_color, _customizer.underglow_pattern, val))
+	v.add_child(intensity)
+	return v
+
+## ---------------------------- Performance panel ------------------------------
+func _build_performance_panel() -> Control:
+	var root_h := HBoxContainer.new()
+	root_h.size_flags_vertical = Control.SIZE_EXPAND_FILL
+
+	# Left column: upgrade list
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 6)
+	v.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	root_h.add_child(v)
+	if _performance:
+		for cat in _performance.ALL_CATEGORIES:
+			var row := HBoxContainer.new()
+			var lbl := Label.new()
+			lbl.text = "%s: %s" % [cat.capitalize(), _performance.current_tier_of(cat)]
+			lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			row.add_child(lbl)
+			var cost: int = _performance.cost_for_next_tier(cat)
+			var up_btn := Button.new()
+			if cost > 0:
+				up_btn.text = "Upgrade (%d QNT)" % cost
+			else:
+				up_btn.text = "Maxed"
+				up_btn.disabled = true
+			up_btn.pressed.connect(func():
+				_performance.purchase_next_tier(cat)
+				_switch_tab(TAB_PERFORMANCE)
+				_refresh_status())
+			row.add_child(up_btn)
+			var refund_btn := Button.new()
+			refund_btn.text = "Refund"
+			refund_btn.disabled = (_performance.current_tier_of(cat) == _performance.TIER_STOCK)
+			refund_btn.pressed.connect(func():
+				_performance.refund_current_tier(cat)
+				_switch_tab(TAB_PERFORMANCE)
+				_refresh_status())
+			row.add_child(refund_btn)
+			v.add_child(row)
+
+		var reset_row := HBoxContainer.new()
+		var reset_btn := Button.new()
+		reset_btn.text = "Reset All To Stock"
+		reset_btn.pressed.connect(func():
+			_performance.reset_all()
+			_switch_tab(TAB_PERFORMANCE)
+			_refresh_status())
+		reset_row.add_child(reset_btn)
+		v.add_child(reset_row)
+
+	# Right column: spider chart
+	_spider_chart_control = Control.new()
+	_spider_chart_control.custom_minimum_size = Vector2(260, 260)
+	_spider_chart_control.draw.connect(_draw_spider_chart)
+	root_h.add_child(_spider_chart_control)
+
+	return root_h
+
+## ---------------------------- Collection panel -------------------------------
+func _build_collection_panel() -> Control:
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 6)
+
+	# Save current configuration as named preset.
+	var save_row := HBoxContainer.new()
+	var name_edit := LineEdit.new()
+	name_edit.placeholder_text = "Preset name"
+	name_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	save_row.add_child(name_edit)
+	var save_btn := Button.new()
+	save_btn.text = "Save Current Build"
+	save_btn.pressed.connect(func():
+		if _customizer and name_edit.text.strip_edges() != "":
+			_customizer.save_configuration(name_edit.text.strip_edges())
+			_switch_tab(TAB_COLLECTION))
+	save_row.add_child(save_btn)
+	v.add_child(save_row)
+
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.custom_minimum_size = Vector2(0, 360)
+	var grid := VBoxContainer.new()
+	scroll.add_child(grid)
+	v.add_child(scroll)
+
+	if _customizer:
+		for cfg_name in _customizer.list_saved_configurations():
+			var item_row := HBoxContainer.new()
+			var lbl := Label.new()
+			lbl.text = cfg_name
+			lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			item_row.add_child(lbl)
+			var load_btn := Button.new()
+			load_btn.text = "Load"
+			load_btn.pressed.connect(func():
+				_customizer.load_configuration(cfg_name)
+				emit_signal("collection_item_selected", cfg_name)
+				_refresh_status())
+			item_row.add_child(load_btn)
+			var del_btn := Button.new()
+			del_btn.text = "Delete"
+			del_btn.pressed.connect(func():
+				_customizer.delete_configuration(cfg_name)
+				_switch_tab(TAB_COLLECTION))
+			item_row.add_child(del_btn)
+			grid.add_child(item_row)
+	return v
+
+## ---------------------------- Marketplace panel ------------------------------
+func _build_marketplace_panel() -> Control:
+	var v := VBoxContainer.new()
+	v.add_theme_constant_override("separation", 6)
+	if _marketplace == null:
+		var lbl := Label.new()
+		lbl.text = "Marketplace not connected."
+		v.add_child(lbl)
+		return v
+
+	# Sell current build
+	var sell_row := HBoxContainer.new()
+	var title_edit := LineEdit.new()
+	title_edit.placeholder_text = "Listing title"
+	title_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sell_row.add_child(title_edit)
+	var price_edit := SpinBox.new()
+	price_edit.min_value = 1
+	price_edit.max_value = 1_000_000
+	price_edit.step = 50
+	price_edit.value = 500
+	sell_row.add_child(price_edit)
+	var sell_btn := Button.new()
+	sell_btn.text = "List Instant"
+	sell_btn.pressed.connect(func():
+		if _customizer and _performance:
+			_marketplace.create_instant_listing(
+				_customizer.export_configuration(),
+				_performance.export_state(),
+				int(price_edit.value),
+				title_edit.text,
+			)
+			_switch_tab(TAB_MARKETPLACE))
+	sell_row.add_child(sell_btn)
+	var auction_btn := Button.new()
+	auction_btn.text = "List Auction (24h)"
+	auction_btn.pressed.connect(func():
+		if _customizer and _performance:
+			_marketplace.create_auction_listing(
+				_customizer.export_configuration(),
+				_performance.export_state(),
+				int(price_edit.value),
+				AUCTION_DURATION_24H_SEC,
+				title_edit.text,
+			)
+			_switch_tab(TAB_MARKETPLACE))
+	sell_row.add_child(auction_btn)
+	v.add_child(sell_row)
+
+	# Trending leaderboard
+	var trend_label := Label.new()
+	trend_label.text = "Trending Builds"
+	trend_label.add_theme_color_override("font_color", ACCENT_COLOR)
+	v.add_child(trend_label)
+
+	var trending := _marketplace.leaderboard_trending(8)
+	var trend_list := VBoxContainer.new()
+	for entry in trending:
+		var row := HBoxContainer.new()
+		var e_label := Label.new()
+		e_label.text = "%s — by %s — score %.1f" % [entry.get("title", ""), entry.get("seller", ""), float(entry.get("score", 0.0))]
+		e_label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row.add_child(e_label)
+		trend_list.add_child(row)
+	v.add_child(trend_list)
+
+	# Active listings
+	var listings_label := Label.new()
+	listings_label.text = "Active Listings"
+	listings_label.add_theme_color_override("font_color", ACCENT_COLOR)
+	v.add_child(listings_label)
+
+	var scroll := ScrollContainer.new()
+	scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	scroll.custom_minimum_size = Vector2(0, 260)
+	var list_v := VBoxContainer.new()
+	scroll.add_child(list_v)
+	v.add_child(scroll)
+
+	for l in _marketplace.list_all_active():
+		var row := HBoxContainer.new()
+		var label := Label.new()
+		label.text = _marketplace.describe_listing(l.id)
+		label.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		row.add_child(label)
+		if l.kind == _marketplace.LISTING_KIND_INSTANT:
+			var buy_btn := Button.new()
+			buy_btn.text = "Buy"
+			buy_btn.pressed.connect(func():
+				_marketplace.buy_instant(l.id)
+				_switch_tab(TAB_MARKETPLACE))
+			row.add_child(buy_btn)
+		else:
+			var bid_spin := SpinBox.new()
+			bid_spin.min_value = _marketplace.min_next_bid(l.id)
+			bid_spin.max_value = 10_000_000
+			bid_spin.step = 50
+			bid_spin.value = bid_spin.min_value
+			row.add_child(bid_spin)
+			var bid_btn := Button.new()
+			bid_btn.text = "Bid"
+			bid_btn.pressed.connect(func():
+				_marketplace.place_bid(l.id, int(bid_spin.value))
+				_switch_tab(TAB_MARKETPLACE))
+			row.add_child(bid_btn)
+		list_v.add_child(row)
+	return v
+
+## -----------------------------------------------------------------------------
+## Before/after compare overlay
+## -----------------------------------------------------------------------------
+func _capture_before() -> void:
+	if _customizer:
+		_before_image = _grab_viewport_image()
+		_status_label.text = "Captured 'before' snapshot."
+
+func _capture_after() -> void:
+	if _customizer:
+		_after_image = _grab_viewport_image()
+		_status_label.text = "Captured 'after' snapshot."
+
+func _grab_viewport_image() -> Image:
+	if _viewport == null:
+		return null
+	var tex := _viewport.get_texture()
+	if tex == null:
+		return null
+	return tex.get_image()
+
+func _toggle_compare() -> void:
+	if _before_image == null or _after_image == null:
+		_status_label.text = "Need both before and after snapshots."
+		return
+	_compare_overlay.visible = not _compare_overlay.visible
+	_compare_overlay.queue_redraw()
+
+func _draw_compare_overlay() -> void:
+	if _compare_overlay == null:
+		return
+	var rect := _compare_overlay.get_rect()
+	if _before_image == null or _after_image == null:
+		return
+	var before_tex := ImageTexture.create_from_image(_before_image)
+	var after_tex := ImageTexture.create_from_image(_after_image)
+	var split_x: float = rect.size.x * _compare_slider_value
+	# Left half — before
+	var left_rect := Rect2(Vector2.ZERO, Vector2(split_x, rect.size.y))
+	_compare_overlay.draw_texture_rect_region(before_tex, left_rect, Rect2(Vector2.ZERO, Vector2(before_tex.get_size().x * _compare_slider_value, before_tex.get_size().y)))
+	# Right half — after
+	var right_rect := Rect2(Vector2(split_x, 0), Vector2(rect.size.x - split_x, rect.size.y))
+	var after_start_x: float = after_tex.get_size().x * _compare_slider_value
+	_compare_overlay.draw_texture_rect_region(after_tex, right_rect, Rect2(Vector2(after_start_x, 0), Vector2(after_tex.get_size().x - after_start_x, after_tex.get_size().y)))
+	# Divider
+	_compare_overlay.draw_line(Vector2(split_x, 0), Vector2(split_x, rect.size.y), ACCENT_COLOR, 2.0)
+	_compare_overlay.draw_string(ThemeDB.fallback_font, Vector2(8, 20), "BEFORE", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color(1, 1, 1))
+	_compare_overlay.draw_string(ThemeDB.fallback_font, Vector2(rect.size.x - 80, 20), "AFTER", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, Color(1, 1, 1))
+
+func _gui_input(event: InputEvent) -> void:
+	if _compare_overlay.visible and event is InputEventMouseMotion:
+		var mm := event as InputEventMouseMotion
+		if mm.button_mask & MOUSE_BUTTON_MASK_LEFT != 0:
+			var rect := _compare_overlay.get_rect()
+			_compare_slider_value = clamp((mm.position.x - rect.position.x) / rect.size.x, 0.0, 1.0)
+			_compare_overlay.queue_redraw()
+
+## -----------------------------------------------------------------------------
+## Spider chart renderer
+## -----------------------------------------------------------------------------
+func _draw_spider_chart() -> void:
+	if _performance == null or _spider_chart_control == null:
+		return
+	var size := _spider_chart_control.size
+	var center := size * 0.5
+	var radius: float = min(size.x, size.y) * 0.42
+
+	# Rings
+	for ring in [0.25, 0.5, 0.75, 1.0]:
+		var pts := PackedVector2Array()
+		for i in range(5):
+			var angle: float = -PI * 0.5 + TAU * float(i) / 5.0
+			pts.append(center + Vector2(cos(angle), sin(angle)) * radius * ring)
+		pts.append(pts[0])
+		_spider_chart_control.draw_polyline(pts, Color(1, 1, 1, 0.15), 1.0)
+
+	# Axes
+	for i in range(5):
+		var angle: float = -PI * 0.5 + TAU * float(i) / 5.0
+		var tip := center + Vector2(cos(angle), sin(angle)) * radius
+		_spider_chart_control.draw_line(center, tip, Color(1, 1, 1, 0.25), 1.0)
+
+	# Data polygon
+	var poly := _performance.build_spider_polygon(center, radius)
+	var fill_color := ACCENT_COLOR
+	fill_color.a = 0.35
+	var closed := PackedVector2Array(poly)
+	if closed.size() > 0:
+		closed.append(closed[0])
+	_spider_chart_control.draw_colored_polygon(poly, fill_color)
+	_spider_chart_control.draw_polyline(closed, ACCENT_COLOR, 2.0)
+
+	# Labels
+	var labels := _performance.spider_chart_labels()
+	for i in range(labels.size()):
+		var angle: float = -PI * 0.5 + TAU * float(i) / float(labels.size())
+		var label_pos := center + Vector2(cos(angle), sin(angle)) * (radius + 14.0) - Vector2(22, 6)
+		_spider_chart_control.draw_string(ThemeDB.fallback_font, label_pos, labels[i], HORIZONTAL_ALIGNMENT_LEFT, -1, 14, Color(1, 1, 1))
+
+func _refresh_spider_chart() -> void:
+	if _spider_chart_control != null:
+		_spider_chart_control.queue_redraw()
+
+## -----------------------------------------------------------------------------
+## Purchase flow
+## -----------------------------------------------------------------------------
+func _on_purchase_clicked() -> void:
+	if _customizer == null:
+		return
+	_pending_cost = _customizer.total_configuration_price()
+	emit_signal("purchase_requested", _pending_cost)
+	_confirm_dialog.dialog_text = "Purchase this configuration for %d QNT?\n\n%s" % [_pending_cost, _customizer.summary_string()]
+	_confirm_dialog.popup_centered(Vector2i(480, 240))
+
+func _on_confirm_dialog_confirmed() -> void:
+	if _performance != null:
+		if _performance.token_balance < _pending_cost:
+			_status_label.text = "Insufficient tokens."
+			return
+		_performance.token_balance -= _pending_cost
+	emit_signal("purchase_confirmed", _pending_cost)
+	_status_label.text = "Purchased for %d QNT." % _pending_cost
+	_refresh_status()
+
+func _on_confirm_dialog_canceled() -> void:
+	emit_signal("purchase_cancelled")
+
+## -----------------------------------------------------------------------------
+## Signal handlers
+## -----------------------------------------------------------------------------
+func _on_stats_recomputed(_stats: Dictionary) -> void:
+	_refresh_spider_chart()
+	_refresh_status()
+
+func _on_any_customizer_change(_a = null, _b = null) -> void:
+	_refresh_status()
+
+## -----------------------------------------------------------------------------
+## Status helpers
+## -----------------------------------------------------------------------------
+func _refresh_status() -> void:
+	if _token_label != null and _performance != null:
+		_token_label.text = "%d QNT" % _performance.token_balance
+	if _status_label != null and _customizer != null:
+		_status_label.text = _customizer.summary_string()
+
+func _wrap_scroll(inner: Control) -> Control:
+	var sc := ScrollContainer.new()
+	sc.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	sc.custom_minimum_size = Vector2(0, 360)
+	inner.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	sc.add_child(inner)
+	return sc
+
+## -----------------------------------------------------------------------------
+## Public API — external controllers can drive the UI
+## -----------------------------------------------------------------------------
+func open_tab(tab_name: String) -> void:
+	_switch_tab(tab_name)
+
+func set_vehicle(vehicle: Node3D) -> void:
+	_vehicle = vehicle
+	if _vehicle and _platform and _vehicle.get_parent() != _platform:
+		if _vehicle.get_parent():
+			_vehicle.get_parent().remove_child(_vehicle)
+		_platform.add_child(_vehicle)
+		_vehicle.position = Vector3.ZERO
+
+func set_auto_rotate(enabled: bool) -> void:
+	auto_rotate = enabled
+
+func snapshot_showroom() -> Image:
+	return _grab_viewport_image()

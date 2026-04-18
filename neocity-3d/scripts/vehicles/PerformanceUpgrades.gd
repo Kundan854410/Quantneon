@@ -1,596 +1,572 @@
-## PerformanceUpgrades — Engine, Brakes, Suspension, Nitro upgrade system.
-## Upgrade tiers: Stock → Sport → Race → Elite.
-## Includes spider chart stat rendering and token cost management.
-
+## PerformanceUpgrades
+## -----------------------------------------------------------------------------
+## Owns the tuning progression for a single player vehicle.
+##
+## Categories:
+##   * engine      — top speed and acceleration
+##   * brakes      — stopping distance
+##   * suspension  — handling / grip
+##   * nitro       — boost duration & thrust
+##
+## Tiers (per category):
+##   * stock → sport → race → elite
+##
+## Visual per-tier effects (rolled up into a "highest tier across categories"):
+##   * sport → body kit attachments at configured mount points
+##   * race  → adds a rear wing
+##   * elite → glowing emissive aura around the chassis
+##
+## The class optionally talks to a VehicleCustomizer instance (if provided) to
+## respect aerodynamic contributions from the current spoiler when computing the
+## final performance profile. It also exposes a spider-chart data builder
+## suitable for direct consumption by a Control-based renderer.
 extends Node
+class_name PerformanceUpgrades
 
-# ---------------------------------------------------------------------------
-# Signals
-# ---------------------------------------------------------------------------
-signal upgrade_purchased(category: String, tier: int)
-signal upgrade_applied(category: String, tier: int)
-signal stats_changed(stats: Dictionary)
-signal insufficient_funds(cost: int, balance: int)
-signal tier_visual_applied(tier: int)
+## -----------------------------------------------------------------------------
+## Signals
+## -----------------------------------------------------------------------------
+signal upgrade_purchased(category: String, tier: String, cost: int)
+signal upgrade_installed(category: String, tier: String)
+signal upgrade_refunded(category: String, tier: String, refund: int)
+signal stats_recomputed(stats: Dictionary)
+signal insufficient_funds(required: int, balance: int)
 
-# ---------------------------------------------------------------------------
-# Upgrade tier constants
-# ---------------------------------------------------------------------------
-const TIER_STOCK := 0
-const TIER_SPORT := 1
-const TIER_RACE  := 2
-const TIER_ELITE := 3
+## -----------------------------------------------------------------------------
+## Constants
+## -----------------------------------------------------------------------------
+const TIER_STOCK: String = "stock"
+const TIER_SPORT: String = "sport"
+const TIER_RACE: String = "race"
+const TIER_ELITE: String = "elite"
 
-const TIER_NAMES := ["Stock", "Sport", "Race", "Elite"]
+const TIER_ORDER: Array[String] = [TIER_STOCK, TIER_SPORT, TIER_RACE, TIER_ELITE]
 
-const TIER_COLORS := [
-	Color(0.6, 0.6, 0.6),   # Stock  — grey
-	Color(0.2, 0.8, 0.2),   # Sport  — green
-	Color(0.2, 0.5, 1.0),   # Race   — blue
-	Color(1.0, 0.6, 0.0),   # Elite  — gold
-]
+const CAT_ENGINE: String = "engine"
+const CAT_BRAKES: String = "brakes"
+const CAT_SUSPENSION: String = "suspension"
+const CAT_NITRO: String = "nitro"
 
-# ---------------------------------------------------------------------------
-# Upgrade categories
-# ---------------------------------------------------------------------------
-const CAT_ENGINE     := "engine"
-const CAT_BRAKES     := "brakes"
-const CAT_SUSPENSION := "suspension"
-const CAT_NITRO      := "nitro"
-const CAT_TURBO      := "turbo"
-const CAT_TIRES      := "tires"
+const ALL_CATEGORIES: Array[String] = [CAT_ENGINE, CAT_BRAKES, CAT_SUSPENSION, CAT_NITRO]
 
-const ALL_CATEGORIES := [CAT_ENGINE, CAT_BRAKES, CAT_SUSPENSION, CAT_NITRO, CAT_TURBO, CAT_TIRES]
-
-# ---------------------------------------------------------------------------
-# Upgrade definitions
-# Multipliers are relative improvements over Stock baseline (1.0)
-# ---------------------------------------------------------------------------
-const UPGRADE_DATA: Dictionary = {
+## Cost table (Quant tokens). Stock is always free and cannot be purchased — it
+## is the default. Higher tiers require the previous tier to be installed first.
+const TIER_COSTS: Dictionary = {
 	CAT_ENGINE: {
-		"display_name": "Engine",
-		"icon": "res://ui/icons/engine.png",
-		"stat_affects": ["speed", "acceleration"],
-		TIER_STOCK: {
-			"cost": 0,
-			"speed_mult": 1.0,
-			"accel_mult": 1.0,
-			"description": "Factory engine. Reliable but slow.",
-		},
-		TIER_SPORT: {
-			"cost": 500,
-			"speed_mult": 1.15,
-			"accel_mult": 1.20,
-			"description": "Ported and polished. +15% speed, +20% acceleration.",
-		},
-		TIER_RACE: {
-			"cost": 1500,
-			"speed_mult": 1.30,
-			"accel_mult": 1.40,
-			"description": "Race-spec internals. +30% speed, +40% acceleration.",
-		},
-		TIER_ELITE: {
-			"cost": 4000,
-			"speed_mult": 1.50,
-			"accel_mult": 1.65,
-			"description": "Elite hyper-tune. +50% speed, +65% acceleration.",
-		},
+		TIER_STOCK: 0,
+		TIER_SPORT: 1200,
+		TIER_RACE:  4200,
+		TIER_ELITE: 11800,
 	},
 	CAT_BRAKES: {
-		"display_name": "Brakes",
-		"icon": "res://ui/icons/brakes.png",
-		"stat_affects": ["braking"],
-		TIER_STOCK: {
-			"cost": 0,
-			"brake_mult": 1.0,
-			"stop_dist_reduction": 0.0,
-			"description": "OEM brake pads. Adequate for street driving.",
-		},
-		TIER_SPORT: {
-			"cost": 400,
-			"brake_mult": 1.18,
-			"stop_dist_reduction": 0.10,
-			"description": "Performance pads and slotted rotors. -10% stopping distance.",
-		},
-		TIER_RACE: {
-			"cost": 1200,
-			"brake_mult": 1.32,
-			"stop_dist_reduction": 0.25,
-			"description": "Race-compound pads and vented rotors. -25% stopping distance.",
-		},
-		TIER_ELITE: {
-			"cost": 3500,
-			"brake_mult": 1.45,
-			"stop_dist_reduction": 0.40,
-			"description": "Carbon-ceramic callipers. -40% stopping distance.",
-		},
+		TIER_STOCK: 0,
+		TIER_SPORT: 800,
+		TIER_RACE:  2600,
+		TIER_ELITE: 7400,
 	},
 	CAT_SUSPENSION: {
-		"display_name": "Suspension",
-		"icon": "res://ui/icons/suspension.png",
-		"stat_affects": ["handling"],
-		TIER_STOCK: {
-			"cost": 0,
-			"handling_mult": 1.0,
-			"steering_mult": 1.0,
-			"description": "Comfort-biased factory suspension.",
-		},
-		TIER_SPORT: {
-			"cost": 450,
-			"handling_mult": 1.12,
-			"steering_mult": 1.08,
-			"description": "Lowered springs with sport dampers. +12% handling.",
-		},
-		TIER_RACE: {
-			"cost": 1400,
-			"handling_mult": 1.22,
-			"steering_mult": 1.18,
-			"description": "Coilover kit with adjustable damping. +22% handling.",
-		},
-		TIER_ELITE: {
-			"cost": 3800,
-			"handling_mult": 1.30,
-			"steering_mult": 1.28,
-			"description": "Active magnetic suspension. +30% handling.",
-		},
+		TIER_STOCK: 0,
+		TIER_SPORT: 950,
+		TIER_RACE:  2950,
+		TIER_ELITE: 8100,
 	},
 	CAT_NITRO: {
-		"display_name": "Nitro",
-		"icon": "res://ui/icons/nitro.png",
-		"stat_affects": ["nitro"],
-		TIER_STOCK: {
-			"cost": 0,
-			"boost_mult": 1.0,
-			"duration_mult": 1.0,
-			"recharge_mult": 1.0,
-			"description": "No nitrous. Stock exhaust only.",
-		},
-		TIER_SPORT: {
-			"cost": 600,
-			"boost_mult": 1.30,
-			"duration_mult": 1.20,
-			"recharge_mult": 0.90,
-			"description": "Small-shot nitrous kit. +30% boost, +20% duration.",
-		},
-		TIER_RACE: {
-			"cost": 1800,
-			"boost_mult": 1.60,
-			"duration_mult": 1.55,
-			"recharge_mult": 0.75,
-			"description": "High-flow nitrous. +60% boost, +55% duration.",
-		},
-		TIER_ELITE: {
-			"cost": 5000,
-			"boost_mult": 2.00,
-			"duration_mult": 2.00,
-			"recharge_mult": 0.50,
-			"description": "Twin-stage nitrous with purge valve. Double boost, double duration.",
-		},
-	},
-	CAT_TURBO: {
-		"display_name": "Turbo",
-		"icon": "res://ui/icons/turbo.png",
-		"stat_affects": ["speed", "acceleration"],
-		TIER_STOCK: {
-			"cost": 0,
-			"boost_pressure": 0.0,
-			"spool_time": 0.0,
-			"description": "Naturally aspirated. No forced induction.",
-		},
-		TIER_SPORT: {
-			"cost": 700,
-			"boost_pressure": 0.5,
-			"spool_time": 1.2,
-			"description": "Single small turbo. +18% peak power.",
-		},
-		TIER_RACE: {
-			"cost": 2200,
-			"boost_pressure": 1.0,
-			"spool_time": 0.9,
-			"description": "Single large turbo. +35% peak power, faster spool.",
-		},
-		TIER_ELITE: {
-			"cost": 6000,
-			"boost_pressure": 1.8,
-			"spool_time": 0.4,
-			"description": "Twin turbo setup. +55% peak power, instant spool.",
-		},
-	},
-	CAT_TIRES: {
-		"display_name": "Tires",
-		"icon": "res://ui/icons/tires.png",
-		"stat_affects": ["handling", "braking"],
-		TIER_STOCK: {
-			"cost": 0,
-			"grip_mult": 1.0,
-			"description": "All-season street tires.",
-		},
-		TIER_SPORT: {
-			"cost": 300,
-			"grip_mult": 1.14,
-			"description": "Performance summer tires. +14% grip.",
-		},
-		TIER_RACE: {
-			"cost": 900,
-			"grip_mult": 1.28,
-			"description": "Semi-slick compound. +28% grip.",
-		},
-		TIER_ELITE: {
-			"cost": 2800,
-			"grip_mult": 1.45,
-			"description": "Full slick race tires. +45% grip.",
-		},
+		TIER_STOCK: 0,
+		TIER_SPORT: 1000,
+		TIER_RACE:  3400,
+		TIER_ELITE: 9500,
 	},
 }
 
-# ---------------------------------------------------------------------------
-# Base stats (Stock = 100 for each axis)
-# ---------------------------------------------------------------------------
-const BASE_STATS := {
-	"speed":        100.0,
-	"acceleration": 100.0,
-	"handling":     100.0,
-	"braking":      100.0,
-	"nitro":        100.0,
+## Per-tier bonus multipliers (fraction of stock). These correspond to the
+## ranges specified in the design brief:
+##   engine:     speed +10–50%
+##   brakes:     stopping distance -10–40% (represented as brake power bonus)
+##   suspension: handling +10–30%
+##   nitro:      boost duration +20–100%, thrust +15–90%
+const TIER_BONUSES: Dictionary = {
+	CAT_ENGINE: {
+		TIER_STOCK: 0.00,
+		TIER_SPORT: 0.12,
+		TIER_RACE:  0.28,
+		TIER_ELITE: 0.50,
+	},
+	CAT_BRAKES: {
+		TIER_STOCK: 0.00,
+		TIER_SPORT: 0.12,
+		TIER_RACE:  0.26,
+		TIER_ELITE: 0.40,
+	},
+	CAT_SUSPENSION: {
+		TIER_STOCK: 0.00,
+		TIER_SPORT: 0.10,
+		TIER_RACE:  0.20,
+		TIER_ELITE: 0.30,
+	},
+	CAT_NITRO: {
+		TIER_STOCK: 0.00,
+		TIER_SPORT: 0.24,
+		TIER_RACE:  0.55,
+		TIER_ELITE: 1.00,
+	},
 }
 
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
-var vehicle_node: Node3D = null
-var owned_tiers: Dictionary = {
-	CAT_ENGINE:     TIER_STOCK,
-	CAT_BRAKES:     TIER_STOCK,
+## Nitro also has a thrust component used by the vehicle controller.
+const NITRO_THRUST_BONUS: Dictionary = {
+	TIER_STOCK: 0.00,
+	TIER_SPORT: 0.15,
+	TIER_RACE:  0.45,
+	TIER_ELITE: 0.90,
+}
+
+## Refund fraction when a tier is removed.
+const REFUND_FRACTION: float = 0.6
+
+## Stock baselines (pre-tuning) used by the stats builder. These values are
+## expressed in user-facing units and are purely for the UI — the vehicle
+## controller applies the multipliers separately to its own physics values.
+const BASE_STATS: Dictionary = {
+	"top_speed_kmh": 210.0,
+	"acceleration_0_100_s": 5.8,
+	"braking_distance_100_0_m": 40.0,
+	"handling_index": 0.55,   # 0..1
+	"nitro_duration_s": 3.0,
+	"nitro_thrust_g": 1.6,
+}
+
+## -----------------------------------------------------------------------------
+## Exported fields
+## -----------------------------------------------------------------------------
+@export var profile_user_id: String = "local_user"
+@export_node_path("Node") var customizer_path: NodePath
+@export_node_path("Node3D") var vehicle_path: NodePath
+
+## -----------------------------------------------------------------------------
+## Runtime state
+## -----------------------------------------------------------------------------
+var current_tiers: Dictionary = {
+	CAT_ENGINE: TIER_STOCK,
+	CAT_BRAKES: TIER_STOCK,
 	CAT_SUSPENSION: TIER_STOCK,
-	CAT_NITRO:      TIER_STOCK,
-	CAT_TURBO:      TIER_STOCK,
-	CAT_TIRES:      TIER_STOCK,
+	CAT_NITRO: TIER_STOCK,
 }
-var equipped_tiers: Dictionary = owned_tiers.duplicate()
-var player_token_balance: int = 0
-var _vehicle_controller = null
 
-# Spider-chart drawing cache
-var _stat_values: Dictionary = {}
-var _spider_chart_control: Control = null
+var token_balance: int = 5000
+var _customizer: Node = null
+var _vehicle: Node3D = null
 
-# ---------------------------------------------------------------------------
-# Lifecycle
-# ---------------------------------------------------------------------------
+var _sport_kit_instance: Node3D = null
+var _race_wing_instance: Node3D = null
+var _elite_aura_instance: Node3D = null
+
+## -----------------------------------------------------------------------------
+## Lifecycle
+## -----------------------------------------------------------------------------
 func _ready() -> void:
-	_recalculate_stats()
+	if customizer_path != NodePath(""):
+		_customizer = get_node_or_null(customizer_path)
+	if vehicle_path != NodePath(""):
+		_vehicle = get_node_or_null(vehicle_path)
+	if _vehicle == null:
+		var p = get_parent()
+		if p is Node3D:
+			_vehicle = p
+	_refresh_visual_tier()
+	emit_signal("stats_recomputed", compute_effective_stats())
 
-func attach_vehicle(v: Node3D) -> void:
-	vehicle_node = v
-	_vehicle_controller = v.get_node_or_null("VehicleController")
-	_apply_all_upgrades()
+## -----------------------------------------------------------------------------
+## Token balance
+## -----------------------------------------------------------------------------
+func set_token_balance(value: int) -> void:
+	token_balance = max(0, value)
 
-func set_player_balance(balance: int) -> void:
-	player_token_balance = balance
+func add_tokens(amount: int) -> void:
+	token_balance = max(0, token_balance + amount)
 
-# ---------------------------------------------------------------------------
-# Purchasing
-# ---------------------------------------------------------------------------
-func can_purchase(category: String, tier: int) -> bool:
-	if not UPGRADE_DATA.has(category):
-		return false
-	var tier_data: Dictionary = UPGRADE_DATA[category][tier]
-	var cost: int = tier_data["cost"]
-	if cost > player_token_balance:
-		return false
-	var current_owned: int = owned_tiers.get(category, TIER_STOCK)
-	return tier == current_owned + 1
+## -----------------------------------------------------------------------------
+## Tier helpers
+## -----------------------------------------------------------------------------
+static func tier_index(tier: String) -> int:
+	return TIER_ORDER.find(tier)
 
-func purchase_upgrade(category: String, tier: int) -> bool:
-	if not can_purchase(category, tier):
-		var cost: int = UPGRADE_DATA[category][tier]["cost"]
-		emit_signal("insufficient_funds", cost, player_token_balance)
-		return false
-
-	var tier_data: Dictionary = UPGRADE_DATA[category][tier]
-	var cost: int = tier_data["cost"]
-	player_token_balance -= cost
-
-	owned_tiers[category] = tier
-	equipped_tiers[category] = tier
-	_apply_upgrade(category, tier)
-	_recalculate_stats()
-	emit_signal("upgrade_purchased", category, tier)
-	emit_signal("stats_changed", _stat_values)
-	_send_purchase_to_network(category, tier, cost)
-	print("[PerformanceUpgrades] Purchased %s tier %d for %d tokens" % [category, tier, cost])
-	return true
-
-func _send_purchase_to_network(category: String, tier: int, cost: int) -> void:
-	var nm = get_node_or_null("/root/NetworkManager")
-	if nm and nm.socket_client:
-		nm.socket_client.send_event("vehicle_upgrade_purchased", {
-			"category": category,
-			"tier": tier,
-			"cost": cost,
-		})
-
-# ---------------------------------------------------------------------------
-# Equip (switch between owned tiers)
-# ---------------------------------------------------------------------------
-func equip_upgrade(category: String, tier: int) -> bool:
-	if not UPGRADE_DATA.has(category):
-		return false
-	if tier > owned_tiers.get(category, TIER_STOCK):
-		return false
-	equipped_tiers[category] = tier
-	_apply_upgrade(category, tier)
-	_recalculate_stats()
-	emit_signal("upgrade_applied", category, tier)
-	emit_signal("stats_changed", _stat_values)
-	return true
-
-# ---------------------------------------------------------------------------
-# Applying upgrades to the vehicle
-# ---------------------------------------------------------------------------
-func _apply_all_upgrades() -> void:
-	for cat in ALL_CATEGORIES:
-		_apply_upgrade(cat, equipped_tiers.get(cat, TIER_STOCK))
-
-func _apply_upgrade(category: String, tier: int) -> void:
-	if vehicle_node == null:
-		return
-	var vc = vehicle_node.get_node_or_null("VehicleController")
-	if vc == null:
-		vc = vehicle_node
-
-	match category:
-		CAT_ENGINE:
-			var data: Dictionary = UPGRADE_DATA[CAT_ENGINE][tier]
-			var base_force: float = vc.get("max_engine_force") if vc.get("max_engine_force") != null else 300.0
-			vc.set("max_engine_force", 300.0 * data["speed_mult"])
-		CAT_BRAKES:
-			var data: Dictionary = UPGRADE_DATA[CAT_BRAKES][tier]
-			vc.set("brake_force", 20.0 * data["brake_mult"])
-		CAT_SUSPENSION:
-			var data: Dictionary = UPGRADE_DATA[CAT_SUSPENSION][tier]
-			vc.set("max_steering_angle", 0.6 * data["steering_mult"])
-		CAT_NITRO:
-			var data: Dictionary = UPGRADE_DATA[CAT_NITRO][tier]
-			if vc.has_method("set_nitro_params"):
-				vc.set_nitro_params(data["boost_mult"], data["duration_mult"], data["recharge_mult"])
-		CAT_TURBO:
-			pass
-		CAT_TIRES:
-			pass
-
-	_apply_tier_visuals(tier)
-	emit_signal("upgrade_applied", category, tier)
-
-func _apply_tier_visuals(highest_tier: int) -> void:
-	if vehicle_node == null:
-		return
-
-	var max_tier := TIER_STOCK
-	for cat in ALL_CATEGORIES:
-		var t := equipped_tiers.get(cat, TIER_STOCK)
-		if t > max_tier:
-			max_tier = t
-
-	match max_tier:
-		TIER_SPORT:
-			_attach_body_kit()
-		TIER_RACE:
-			_attach_body_kit()
-			_attach_race_wing()
-		TIER_ELITE:
-			_attach_body_kit()
-			_attach_race_wing()
-			_attach_elite_aura()
-
-	emit_signal("tier_visual_applied", max_tier)
-
-func _attach_body_kit() -> void:
-	if vehicle_node == null:
-		return
-	if vehicle_node.has_node("BodyKit"):
-		return
-	var marker := Node3D.new()
-	marker.name = "BodyKit"
-	vehicle_node.add_child(marker)
-
-func _attach_race_wing() -> void:
-	if vehicle_node == null:
-		return
-	if vehicle_node.has_node("RaceWing"):
-		return
-	var wing := MeshInstance3D.new()
-	wing.name = "RaceWing"
-	wing.position = Vector3(0, 0.9, 1.6)
-	var mesh := BoxMesh.new()
-	mesh.size = Vector3(1.6, 0.05, 0.5)
-	wing.mesh = mesh
-	var mat := StandardMaterial3D.new()
-	mat.albedo_color = Color(0.05, 0.05, 0.05)
-	mat.metallic = 0.8
-	mat.roughness = 0.1
-	wing.set_surface_override_material(0, mat)
-	vehicle_node.add_child(wing)
-
-func _attach_elite_aura() -> void:
-	if vehicle_node == null:
-		return
-	if vehicle_node.has_node("EliteAura"):
-		return
-	var aura := OmniLight3D.new()
-	aura.name = "EliteAura"
-	aura.light_color = TIER_COLORS[TIER_ELITE]
-	aura.light_energy = 3.0
-	aura.omni_range = 4.0
-	vehicle_node.add_child(aura)
-
-# ---------------------------------------------------------------------------
-# Stat calculation
-# ---------------------------------------------------------------------------
-func _recalculate_stats() -> void:
-	var stats := BASE_STATS.duplicate()
-
-	var eng_tier := equipped_tiers.get(CAT_ENGINE, TIER_STOCK)
-	stats["speed"]        *= UPGRADE_DATA[CAT_ENGINE][eng_tier]["speed_mult"]
-	stats["acceleration"] *= UPGRADE_DATA[CAT_ENGINE][eng_tier]["accel_mult"]
-
-	var brk_tier := equipped_tiers.get(CAT_BRAKES, TIER_STOCK)
-	stats["braking"] *= UPGRADE_DATA[CAT_BRAKES][brk_tier]["brake_mult"]
-
-	var sus_tier := equipped_tiers.get(CAT_SUSPENSION, TIER_STOCK)
-	stats["handling"] *= UPGRADE_DATA[CAT_SUSPENSION][sus_tier]["handling_mult"]
-
-	var nit_tier := equipped_tiers.get(CAT_NITRO, TIER_STOCK)
-	stats["nitro"] *= UPGRADE_DATA[CAT_NITRO][nit_tier]["boost_mult"]
-
-	var tir_tier := equipped_tiers.get(CAT_TIRES, TIER_STOCK)
-	stats["handling"] *= UPGRADE_DATA[CAT_TIRES][tir_tier]["grip_mult"]
-	stats["braking"]  *= UPGRADE_DATA[CAT_TIRES][tir_tier]["grip_mult"]
-
-	for key in stats:
-		stats[key] = minf(stats[key], 200.0)
-
-	_stat_values = stats
-
-func get_stats() -> Dictionary:
-	return _stat_values.duplicate()
-
-func get_stat_normalized(stat: String) -> float:
-	var val: float = _stat_values.get(stat, 100.0)
-	return clampf(val / 200.0, 0.0, 1.0)
-
-# ---------------------------------------------------------------------------
-# Spider chart — draws onto a Control node using _draw()
-# ---------------------------------------------------------------------------
-func create_spider_chart(parent: Control) -> Control:
-	var chart := _SpiderChart.new()
-	chart.custom_minimum_size = Vector2(220, 220)
-	chart.set_upgrader(self)
-	parent.add_child(chart)
-	_spider_chart_control = chart
-	return chart
-
-func refresh_spider_chart() -> void:
-	if _spider_chart_control and is_instance_valid(_spider_chart_control):
-		_spider_chart_control.queue_redraw()
-
-# ---------------------------------------------------------------------------
-# Save / Load
-# ---------------------------------------------------------------------------
-func save_upgrades() -> void:
-	var data := {
-		"owned": owned_tiers,
-		"equipped": equipped_tiers,
-	}
-	var file := FileAccess.open("user://vehicle_upgrades.json", FileAccess.WRITE)
-	if file:
-		file.store_string(JSON.stringify(data, "\t"))
-
-func load_upgrades() -> void:
-	if not FileAccess.file_exists("user://vehicle_upgrades.json"):
-		return
-	var file := FileAccess.open("user://vehicle_upgrades.json", FileAccess.READ)
-	if not file:
-		return
-	var result = JSON.parse_string(file.get_as_text())
-	if not result is Dictionary:
-		return
-	if result.has("owned"):
-		for cat in ALL_CATEGORIES:
-			if result["owned"].has(cat):
-				owned_tiers[cat] = int(result["owned"][cat])
-	if result.has("equipped"):
-		for cat in ALL_CATEGORIES:
-			if result["equipped"].has(cat):
-				equipped_tiers[cat] = int(result["equipped"][cat])
-	_recalculate_stats()
-
-func get_owned_tier(category: String) -> int:
-	return owned_tiers.get(category, TIER_STOCK)
-
-func get_equipped_tier(category: String) -> int:
-	return equipped_tiers.get(category, TIER_STOCK)
-
-func get_total_cost_to_max() -> int:
-	var total := 0
-	for cat in ALL_CATEGORIES:
-		var owned := owned_tiers.get(cat, TIER_STOCK)
-		for tier in range(owned + 1, TIER_ELITE + 1):
-			total += UPGRADE_DATA[cat][tier]["cost"]
-	return total
-
-func get_upgrade_cost(category: String, tier: int) -> int:
-	if not UPGRADE_DATA.has(category):
-		return 0
-	return UPGRADE_DATA[category][tier].get("cost", 0)
-
-func get_upgrade_description(category: String, tier: int) -> String:
-	if not UPGRADE_DATA.has(category):
+static func next_tier(tier: String) -> String:
+	var idx := tier_index(tier)
+	if idx < 0:
+		return TIER_STOCK
+	if idx >= TIER_ORDER.size() - 1:
 		return ""
-	return UPGRADE_DATA[category][tier].get("description", "")
+	return TIER_ORDER[idx + 1]
 
-# ---------------------------------------------------------------------------
-# Inner class — spider chart Control
-# ---------------------------------------------------------------------------
-class _SpiderChart extends Control:
-	var _upgrader: Node = null
-	const AXES := ["speed", "acceleration", "handling", "braking", "nitro"]
-	const AXIS_LABELS := ["Speed", "Accel", "Handle", "Brake", "Nitro"]
-	const RING_COUNT := 4
-	const BG_COLOR    := Color(0.08, 0.08, 0.12, 0.9)
-	const RING_COLOR  := Color(0.3, 0.3, 0.4, 0.5)
-	const AXIS_COLOR  := Color(0.5, 0.5, 0.6, 0.8)
-	const FILL_COLOR  := Color(0.2, 0.6, 1.0, 0.35)
-	const STROKE_COLOR := Color(0.3, 0.8, 1.0, 0.9)
-	const LABEL_COLOR := Color(0.9, 0.9, 1.0, 1.0)
+static func previous_tier(tier: String) -> String:
+	var idx := tier_index(tier)
+	if idx <= 0:
+		return ""
+	return TIER_ORDER[idx - 1]
 
-	func set_upgrader(u: Node) -> void:
-		_upgrader = u
+func current_tier_of(category: String) -> String:
+	return String(current_tiers.get(category, TIER_STOCK))
 
-	func _draw() -> void:
-		if _upgrader == null:
-			return
-		var center := size / 2.0
-		var radius := minf(size.x, size.y) / 2.0 - 28.0
-		var n := AXES.size()
-		var angle_step := TAU / float(n)
+func cost_for_next_tier(category: String) -> int:
+	var nxt := next_tier(current_tier_of(category))
+	if nxt == "":
+		return 0
+	return int(TIER_COSTS.get(category, {}).get(nxt, 0))
 
-		draw_rect(Rect2(Vector2.ZERO, size), BG_COLOR, true)
+func total_invested_tokens() -> int:
+	var sum := 0
+	for cat in ALL_CATEGORIES:
+		var t = current_tier_of(cat)
+		var idx := tier_index(t)
+		for i in range(1, idx + 1):
+			sum += int(TIER_COSTS.get(cat, {}).get(TIER_ORDER[i], 0))
+	return sum
 
-		# Rings
-		for ring in range(1, RING_COUNT + 1):
-			var r := radius * float(ring) / float(RING_COUNT)
-			var pts: PackedVector2Array = PackedVector2Array()
-			for i in range(n):
-				var angle := -PI / 2.0 + angle_step * i
-				pts.append(center + Vector2(cos(angle), sin(angle)) * r)
-			draw_polyline(pts + PackedVector2Array([pts[0]]), RING_COLOR, 1.0)
+## -----------------------------------------------------------------------------
+## Purchase / install / refund
+## -----------------------------------------------------------------------------
+func can_purchase_next(category: String) -> bool:
+	if not category in ALL_CATEGORIES:
+		return false
+	var nxt := next_tier(current_tier_of(category))
+	if nxt == "":
+		return false
+	return token_balance >= int(TIER_COSTS.get(category, {}).get(nxt, 0))
 
-		# Axis lines
-		for i in range(n):
-			var angle := -PI / 2.0 + angle_step * i
-			var end := center + Vector2(cos(angle), sin(angle)) * radius
-			draw_line(center, end, AXIS_COLOR, 1.0)
+func purchase_next_tier(category: String) -> bool:
+	if not category in ALL_CATEGORIES:
+		push_warning("[PerformanceUpgrades] Unknown category: " + category)
+		return false
+	var nxt := next_tier(current_tier_of(category))
+	if nxt == "":
+		return false
+	var cost := int(TIER_COSTS.get(category, {}).get(nxt, 0))
+	if token_balance < cost:
+		emit_signal("insufficient_funds", cost, token_balance)
+		return false
+	token_balance -= cost
+	current_tiers[category] = nxt
+	emit_signal("upgrade_purchased", category, nxt, cost)
+	emit_signal("upgrade_installed", category, nxt)
+	_refresh_visual_tier()
+	emit_signal("stats_recomputed", compute_effective_stats())
+	return true
 
-		# Data polygon
-		var stats_pts: PackedVector2Array = PackedVector2Array()
-		for i in range(n):
-			var stat_name := AXES[i]
-			var val := _upgrader.get_stat_normalized(stat_name) if _upgrader.has_method("get_stat_normalized") else 0.5
-			var angle := -PI / 2.0 + angle_step * i
-			stats_pts.append(center + Vector2(cos(angle), sin(angle)) * radius * val)
+func refund_current_tier(category: String) -> bool:
+	if not category in ALL_CATEGORIES:
+		return false
+	var cur := current_tier_of(category)
+	var prev := previous_tier(cur)
+	if prev == "":
+		return false
+	var cost := int(TIER_COSTS.get(category, {}).get(cur, 0))
+	var refund := int(round(float(cost) * REFUND_FRACTION))
+	token_balance += refund
+	current_tiers[category] = prev
+	emit_signal("upgrade_refunded", category, cur, refund)
+	_refresh_visual_tier()
+	emit_signal("stats_recomputed", compute_effective_stats())
+	return true
 
-		draw_colored_polygon(stats_pts, FILL_COLOR)
-		draw_polyline(stats_pts + PackedVector2Array([stats_pts[0]]), STROKE_COLOR, 2.0)
+func install_tier(category: String, tier: String, charge_tokens: bool = true) -> bool:
+	# Admin / shop-driven install path. Sets the category directly (respecting
+	# ordering). If charge_tokens is true, the *sum* of tier costs up to and
+	# including the target tier is deducted from the balance.
+	if not category in ALL_CATEGORIES:
+		return false
+	if not tier in TIER_ORDER:
+		return false
+	var target_idx := tier_index(tier)
+	var current_idx := tier_index(current_tier_of(category))
+	if target_idx <= current_idx:
+		return false
+	var cumulative_cost := 0
+	for i in range(current_idx + 1, target_idx + 1):
+		cumulative_cost += int(TIER_COSTS.get(category, {}).get(TIER_ORDER[i], 0))
+	if charge_tokens:
+		if token_balance < cumulative_cost:
+			emit_signal("insufficient_funds", cumulative_cost, token_balance)
+			return false
+		token_balance -= cumulative_cost
+	current_tiers[category] = tier
+	emit_signal("upgrade_purchased", category, tier, cumulative_cost)
+	emit_signal("upgrade_installed", category, tier)
+	_refresh_visual_tier()
+	emit_signal("stats_recomputed", compute_effective_stats())
+	return true
 
-		# Dots on vertices
-		for pt in stats_pts:
-			draw_circle(pt, 4.0, STROKE_COLOR)
+func reset_all() -> void:
+	# Full rollback to stock across every category; tokens are refunded at the
+	# standard refund fraction.
+	var total_refund := 0
+	for cat in ALL_CATEGORIES:
+		var idx := tier_index(current_tier_of(cat))
+		for i in range(1, idx + 1):
+			total_refund += int(round(float(TIER_COSTS.get(cat, {}).get(TIER_ORDER[i], 0)) * REFUND_FRACTION))
+		current_tiers[cat] = TIER_STOCK
+	token_balance += total_refund
+	_refresh_visual_tier()
+	emit_signal("stats_recomputed", compute_effective_stats())
 
-		# Labels
-		for i in range(n):
-			var angle := -PI / 2.0 + angle_step * i
-			var lbl_pos := center + Vector2(cos(angle), sin(angle)) * (radius + 18.0)
-			var font := ThemeDB.fallback_font
-			var font_size := 11
-			draw_string(font, lbl_pos - Vector2(20, 6), AXIS_LABELS[i], HORIZONTAL_ALIGNMENT_CENTER, 50, font_size, LABEL_COLOR)
+## -----------------------------------------------------------------------------
+## Highest tier across categories (drives visual effects)
+## -----------------------------------------------------------------------------
+func highest_installed_tier() -> String:
+	var highest_idx := 0
+	for cat in ALL_CATEGORIES:
+		var idx := tier_index(current_tier_of(cat))
+		if idx > highest_idx:
+			highest_idx = idx
+	return TIER_ORDER[highest_idx]
+
+func tier_count_at_or_above(tier: String) -> int:
+	var target_idx := tier_index(tier)
+	var count := 0
+	for cat in ALL_CATEGORIES:
+		if tier_index(current_tier_of(cat)) >= target_idx:
+			count += 1
+	return count
+
+## -----------------------------------------------------------------------------
+## Visual upgrades — body kit, wing, aura
+## -----------------------------------------------------------------------------
+func _refresh_visual_tier() -> void:
+	_apply_sport_kit(highest_installed_tier() != TIER_STOCK)
+	_apply_race_wing(tier_index(highest_installed_tier()) >= tier_index(TIER_RACE))
+	_apply_elite_aura(highest_installed_tier() == TIER_ELITE)
+
+func _apply_sport_kit(enabled: bool) -> void:
+	if _vehicle == null:
+		return
+	var mount = _vehicle.get_node_or_null("BodyKitMount")
+	if mount == null:
+		mount = _vehicle
+	if enabled:
+		if _sport_kit_instance == null or not is_instance_valid(_sport_kit_instance):
+			_sport_kit_instance = Node3D.new()
+			_sport_kit_instance.name = "SportBodyKit"
+			# Front splitter
+			var splitter := MeshInstance3D.new()
+			var sm := BoxMesh.new()
+			sm.size = Vector3(1.9, 0.06, 0.35)
+			splitter.mesh = sm
+			splitter.position = Vector3(0, 0.05, 1.6)
+			_sport_kit_instance.add_child(splitter)
+			# Side skirts
+			for side in [-1.0, 1.0]:
+				var skirt := MeshInstance3D.new()
+				var bm := BoxMesh.new()
+				bm.size = Vector3(0.08, 0.12, 2.5)
+				skirt.mesh = bm
+				skirt.position = Vector3(side * 0.98, 0.18, 0.0)
+				_sport_kit_instance.add_child(skirt)
+			# Rear diffuser
+			var diff := MeshInstance3D.new()
+			var dm := BoxMesh.new()
+			dm.size = Vector3(1.7, 0.08, 0.45)
+			diff.mesh = dm
+			diff.position = Vector3(0, 0.1, -1.6)
+			_sport_kit_instance.add_child(diff)
+			_tint_children(_sport_kit_instance, Color(0.08, 0.08, 0.08), 0.6, 0.2)
+			mount.add_child(_sport_kit_instance)
+	else:
+		if _sport_kit_instance != null and is_instance_valid(_sport_kit_instance):
+			_sport_kit_instance.queue_free()
+			_sport_kit_instance = null
+
+func _apply_race_wing(enabled: bool) -> void:
+	if _vehicle == null:
+		return
+	if enabled:
+		if _race_wing_instance == null or not is_instance_valid(_race_wing_instance):
+			_race_wing_instance = Node3D.new()
+			_race_wing_instance.name = "RaceWing"
+			# Two vertical struts
+			for side in [-1.0, 1.0]:
+				var strut := MeshInstance3D.new()
+				var cm := CylinderMesh.new()
+				cm.top_radius = 0.025
+				cm.bottom_radius = 0.025
+				cm.height = 0.35
+				strut.mesh = cm
+				strut.position = Vector3(side * 0.65, 1.25, -1.4)
+				_race_wing_instance.add_child(strut)
+			# Wing blade
+			var blade := MeshInstance3D.new()
+			var bm := BoxMesh.new()
+			bm.size = Vector3(1.8, 0.08, 0.45)
+			blade.mesh = bm
+			blade.position = Vector3(0, 1.45, -1.4)
+			_race_wing_instance.add_child(blade)
+			_tint_children(_race_wing_instance, Color(0.05, 0.05, 0.05), 0.8, 0.15)
+			_vehicle.add_child(_race_wing_instance)
+	else:
+		if _race_wing_instance != null and is_instance_valid(_race_wing_instance):
+			_race_wing_instance.queue_free()
+			_race_wing_instance = null
+
+func _apply_elite_aura(enabled: bool) -> void:
+	if _vehicle == null:
+		return
+	if enabled:
+		if _elite_aura_instance == null or not is_instance_valid(_elite_aura_instance):
+			_elite_aura_instance = Node3D.new()
+			_elite_aura_instance.name = "EliteAura"
+			var omni := OmniLight3D.new()
+			omni.light_color = Color(1.0, 0.3, 1.0)
+			omni.light_energy = 3.2
+			omni.omni_range = 4.5
+			omni.position = Vector3(0, 0.3, 0)
+			_elite_aura_instance.add_child(omni)
+			# A subtle torus shell with emissive shader as visible aura ring.
+			var ring := MeshInstance3D.new()
+			var tm := TorusMesh.new()
+			tm.inner_radius = 1.6
+			tm.outer_radius = 1.8
+			ring.mesh = tm
+			var aura_mat := StandardMaterial3D.new()
+			aura_mat.albedo_color = Color(1.0, 0.3, 1.0, 0.35)
+			aura_mat.emission_enabled = true
+			aura_mat.emission = Color(1.0, 0.3, 1.0)
+			aura_mat.emission_energy_multiplier = 2.8
+			aura_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+			ring.material_override = aura_mat
+			ring.rotation = Vector3(PI * 0.5, 0, 0)
+			ring.position = Vector3(0, 0.05, 0)
+			_elite_aura_instance.add_child(ring)
+			_vehicle.add_child(_elite_aura_instance)
+	else:
+		if _elite_aura_instance != null and is_instance_valid(_elite_aura_instance):
+			_elite_aura_instance.queue_free()
+			_elite_aura_instance = null
+
+func _tint_children(root: Node, color: Color, metallic: float, roughness: float) -> void:
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = color
+	mat.metallic = metallic
+	mat.roughness = roughness
+	for child in root.get_children():
+		if child is MeshInstance3D:
+			child.material_override = mat
+
+## -----------------------------------------------------------------------------
+## Effective stats — spider chart data
+## -----------------------------------------------------------------------------
+func compute_effective_stats() -> Dictionary:
+	var eng_bonus: float = _bonus_of(CAT_ENGINE)
+	var brk_bonus: float = _bonus_of(CAT_BRAKES)
+	var sus_bonus: float = _bonus_of(CAT_SUSPENSION)
+	var nit_bonus: float = _bonus_of(CAT_NITRO)
+	var nit_thrust_bonus: float = float(NITRO_THRUST_BONUS.get(current_tier_of(CAT_NITRO), 0.0))
+
+	var customizer_downforce: float = 0.0
+	var customizer_drag: float = 0.0
+	if _customizer and _customizer.has_method("get_spoiler_downforce"):
+		customizer_downforce = float(_customizer.call("get_spoiler_downforce"))
+	if _customizer and _customizer.has_method("get_spoiler_drag"):
+		customizer_drag = float(_customizer.call("get_spoiler_drag"))
+
+	# Engine bonus reduces by drag contribution; suspension boosted by downforce.
+	var effective_engine_bonus: float = max(0.0, eng_bonus - customizer_drag * 0.4)
+	var effective_handling_bonus: float = sus_bonus + customizer_downforce * 0.2
+
+	var top_speed: float = BASE_STATS.top_speed_kmh * (1.0 + effective_engine_bonus)
+	var accel: float = BASE_STATS.acceleration_0_100_s / (1.0 + effective_engine_bonus * 0.85)
+	var brake_dist: float = BASE_STATS.braking_distance_100_0_m * (1.0 - brk_bonus)
+	var handling: float = clamp(BASE_STATS.handling_index * (1.0 + effective_handling_bonus), 0.0, 1.0)
+	var nitro_dur: float = BASE_STATS.nitro_duration_s * (1.0 + nit_bonus)
+	var nitro_thrust: float = BASE_STATS.nitro_thrust_g * (1.0 + nit_thrust_bonus)
+
+	return {
+		"top_speed_kmh": top_speed,
+		"acceleration_0_100_s": accel,
+		"braking_distance_100_0_m": brake_dist,
+		"handling_index": handling,
+		"nitro_duration_s": nitro_dur,
+		"nitro_thrust_g": nitro_thrust,
+		"tiers": current_tiers.duplicate(true),
+		"highest_tier": highest_installed_tier(),
+	}
+
+func _bonus_of(category: String) -> float:
+	return float(TIER_BONUSES.get(category, {}).get(current_tier_of(category), 0.0))
+
+## Returns a normalized 0..1 array keyed in the canonical spider-chart order:
+##   [speed, handling, braking, acceleration, nitro]
+func spider_chart_points() -> Array:
+	var s := compute_effective_stats()
+	# Normalize each axis against a reasonable "elite max" ceiling so the chart
+	# visually fills as the player upgrades.
+	var speed_norm: float = clamp((s.top_speed_kmh - 180.0) / (380.0 - 180.0), 0.0, 1.0)
+	var handling_norm: float = clamp(s.handling_index, 0.0, 1.0)
+	# Lower brake distance is better — invert.
+	var brake_norm: float = clamp(1.0 - (s.braking_distance_100_0_m / BASE_STATS.braking_distance_100_0_m) + 0.25, 0.0, 1.0)
+	# Lower accel time is better — invert.
+	var accel_norm: float = clamp(1.0 - (s.acceleration_0_100_s / BASE_STATS.acceleration_0_100_s) + 0.25, 0.0, 1.0)
+	var nitro_norm: float = clamp((s.nitro_duration_s - 2.5) / (7.5 - 2.5), 0.0, 1.0)
+	return [speed_norm, handling_norm, brake_norm, accel_norm, nitro_norm]
+
+func spider_chart_labels() -> Array:
+	return ["Speed", "Handling", "Braking", "Acceleration", "Nitro"]
+
+## Builds 2D polygon points for a regular pentagon spider chart centered at
+## origin with the given radius. The polygon's vertices are scaled by
+## spider_chart_points() so it renders directly with Polygon2D or lines.
+func build_spider_polygon(center: Vector2, radius: float) -> PackedVector2Array:
+	var points := spider_chart_points()
+	var n := points.size()
+	var out := PackedVector2Array()
+	out.resize(n)
+	for i in range(n):
+		var angle: float = -PI * 0.5 + TAU * float(i) / float(n)
+		var r: float = radius * float(points[i])
+		out[i] = center + Vector2(cos(angle), sin(angle)) * r
+	return out
+
+func build_spider_axis_polygon(center: Vector2, radius: float) -> PackedVector2Array:
+	var n := 5
+	var out := PackedVector2Array()
+	out.resize(n)
+	for i in range(n):
+		var angle: float = -PI * 0.5 + TAU * float(i) / float(n)
+		out[i] = center + Vector2(cos(angle), sin(angle)) * radius
+	return out
+
+## -----------------------------------------------------------------------------
+## Serialization
+## -----------------------------------------------------------------------------
+func export_state() -> Dictionary:
+	return {
+		"version": 1,
+		"owner": profile_user_id,
+		"tiers": current_tiers.duplicate(true),
+		"balance": token_balance,
+	}
+
+func import_state(state: Dictionary) -> bool:
+	if state.is_empty():
+		return false
+	var t: Dictionary = state.get("tiers", {})
+	for cat in ALL_CATEGORIES:
+		if t.has(cat) and TIER_ORDER.has(t[cat]):
+			current_tiers[cat] = t[cat]
+	if state.has("balance"):
+		token_balance = int(state["balance"])
+	_refresh_visual_tier()
+	emit_signal("stats_recomputed", compute_effective_stats())
+	return true
+
+## -----------------------------------------------------------------------------
+## Convenience queries
+## -----------------------------------------------------------------------------
+func describe() -> String:
+	var lines := PackedStringArray()
+	for cat in ALL_CATEGORIES:
+		lines.append("%s: %s" % [cat, current_tier_of(cat)])
+	lines.append("Balance: %d QNT" % token_balance)
+	return "\n".join(lines)
+
+func is_fully_elite() -> bool:
+	for cat in ALL_CATEGORIES:
+		if current_tier_of(cat) != TIER_ELITE:
+			return false
+	return true
