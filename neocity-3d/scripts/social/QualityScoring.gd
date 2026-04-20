@@ -9,6 +9,7 @@ const MAX_COMMUNICATION_SECONDS: float = 30.0 * 60.0
 const BASE_INTERACTION_WEIGHT: float = 0.55
 const SHARED_EVENT_WEIGHT: float = 0.25
 const COMMUNICATION_WEIGHT: float = 0.20
+const MIN_DECAY_SUM_THRESHOLD: float = 0.0001
 
 var _interactions: Dictionary = {}
 var _resonance_cache: Dictionary = {}
@@ -21,21 +22,21 @@ func record_interaction(
     interaction_quality: float,
     shared_event_participation: float = 0.0,
     communication_seconds: float = 0.0,
-    timestamp: int = 0
+    timestamp: int = -1
 ) -> void:
     if user_id == "" or peer_id == "":
         return
-    var ts: int = timestamp if timestamp > 0 else Time.get_unix_time_from_system()
+    var ts: int = timestamp if timestamp >= 0 else Time.get_unix_time_from_system()
     _store_interaction(user_id, peer_id, interaction_quality, shared_event_participation, communication_seconds, ts)
     _store_interaction(peer_id, user_id, interaction_quality, shared_event_participation, communication_seconds, ts)
     _increment_pair_mutual_count(user_id, peer_id)
     _refresh_scores_for_pair(user_id, peer_id)
 
 
-func record_shared_event_participation(user_ids: Array, event_weight: float = 1.0, timestamp: int = 0) -> void:
+func record_shared_event_participation(user_ids: Array, event_weight: float = 1.0, timestamp: int = -1) -> void:
     if user_ids.size() < 2:
         return
-    var ts: int = timestamp if timestamp > 0 else Time.get_unix_time_from_system()
+    var ts: int = timestamp if timestamp >= 0 else Time.get_unix_time_from_system()
     var clean_weight: float = clampf(event_weight, 0.0, 1.0)
     for i in range(user_ids.size()):
         for j in range(i + 1, user_ids.size()):
@@ -184,7 +185,7 @@ func _recompute_user_score(user_id: String) -> float:
         weighted_sum += base_score * recency_decay * mutual_multiplier
         decay_sum += recency_decay
 
-    if decay_sum <= 0.0001:
+    if decay_sum <= MIN_DECAY_SUM_THRESHOLD:
         return 0.0
     return clampf(weighted_sum / decay_sum, 0.0, 1.0)
 

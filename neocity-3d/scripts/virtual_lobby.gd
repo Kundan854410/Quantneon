@@ -31,8 +31,10 @@ signal capacity_reached()
 var active_stream_id: String = ""
 var present_users: Dictionary = {} # { user_id: { display_name, avatar_node } }
 var _avatar_scene: PackedScene = null
-var quality_scoring: QualityScoring
-var instance_router: InstanceRouter
+# Rolling social quality scoring service for this lobby session.
+var quality_scoring: QualityScoring = null
+# Dynamic router that assigns users to resonance-similar social instances.
+var instance_router: InstanceRouter = null
 var _instance_aura_cache: Dictionary = {}
 
 # ─── Lifecycle ────────────────────────────────────────────────────────────────
@@ -76,9 +78,8 @@ func join_lobby(user_id: String, dname: String) -> bool:
 		emit_signal("capacity_reached")
 		return false
 	
-	present_users[user_id] = { "display_name": dname, "avatar_node": null }
 	var instance_id: String = instance_router.route_user(user_id)
-	present_users[user_id]["instance_id"] = instance_id
+	present_users[user_id] = { "display_name": dname, "avatar_node": null, "instance_id": instance_id }
 	emit_signal("user_joined", user_id, dname)
 	
 	# Notify server
@@ -131,8 +132,8 @@ func _on_remote_user_joined(data: Dictionary) -> void:
 	var uid = data.get("userId", "")
 	var dname = data.get("username", uid)
 	if uid != "" and not present_users.has(uid):
-		present_users[uid] = { "display_name": dname, "avatar_node": null }
-		present_users[uid]["instance_id"] = instance_router.route_user(uid)
+		var instance_id: String = instance_router.route_user(uid)
+		present_users[uid] = { "display_name": dname, "avatar_node": null, "instance_id": instance_id }
 		emit_signal("user_joined", uid, dname)
 
 func _on_remote_user_left(data: Dictionary) -> void:

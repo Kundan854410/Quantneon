@@ -9,6 +9,9 @@ signal instance_cue_updated(instance_id: String, cue_payload: Dictionary)
 @export var target_instance_size: int = 20
 @export var max_instance_size: int = 35
 
+const RESONANCE_INTENSITY_WEIGHT: float = 0.65
+const DENSITY_INTENSITY_WEIGHT: float = 0.35
+
 var quality_scoring: QualityScoring
 
 var _user_assignments: Dictionary = {}
@@ -120,10 +123,10 @@ func _select_instance_for_band(band: String, score: float) -> String:
         var users: Array = entry.get("users", [])
         if users.size() >= max_instance_size:
             continue
-        if users.size() >= target_instance_size:
-            continue
         var center: float = float(entry.get("resonance_center", 0.0))
         var gap: float = absf(center - score)
+        if users.size() >= target_instance_size:
+            gap += 0.15
         if gap < best_gap:
             best_gap = gap
             best_instance = instance_id
@@ -210,7 +213,11 @@ func _build_instance_cue(entry: Dictionary) -> Dictionary:
     var density_ratio: float = clampf(float(users.size()) / float(max(1, max_instance_size)), 0.0, 1.0)
 
     var color: Color = _color_for_band(band)
-    var intensity: float = clampf((center * 0.65) + (density_ratio * 0.35), 0.1, 1.0)
+    var intensity: float = clampf(
+        (center * RESONANCE_INTENSITY_WEIGHT) + (density_ratio * DENSITY_INTENSITY_WEIGHT),
+        0.1,
+        1.0
+    )
     var pulse_speed: float = lerpf(0.6, 2.2, center)
     var environmental_reverb: float = lerpf(0.05, 0.35, center)
 
