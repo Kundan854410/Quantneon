@@ -24,8 +24,84 @@ export interface SocketUser {
   room?: string;
 }
 
-// TODO(launch-blocker): Replace this fallback Map with a Redis-backed presence registry before multi-instance production rollout.
-const onlineUsers = new Map<string, SocketUser>();
+/**
+ * Redis-backed user presence registry for multi-instance deployments.
+ * Keys: `presence:user:{userId}`
+ * Value: JSON-serialized SocketUser with TTL of 30 seconds (auto-expire on disconnect)
+ */
+class PresenceRegistry {
+  private static PRESENCE_PREFIX = 'presence:user:';
+  private static PRESENCE_TTL = 30; // seconds
+
+  /**
+   * Mark user as online with automatic expiry
+   */
+  static async setOnline(user: SocketUser): Promise<void> {
+    try {
+      const key = `${this.PRESENCE_PREFIX}${user.userId}`;
+      await redis.setex(key, this.PRESENCE_TTL, JSON.stringify(user));
+    } catch (err) {
+      logger.error({ err, userId: user.userId }, 'Failed to set user presence in Redis');
+    }
+  }
+
+  /**
+   * Get user presence data
+   */
+  static async getUser(userId: string): Promise<SocketUser | null> {
+    try {
+      const key = `${this.PRESENCE_PREFIX}${userId}`;
+      const data = await redis.get(key);
+      return data ? JSON.parse(data) : null;
+    } catch (err) {
+      logger.error({ err, userId }, 'Failed to get user presence from Redis');
+      return null;
+    }
+  }
+
+  /**
+   * Remove user from presence registry
+   */
+  static async setOffline(userId: string): Promise<void> {
+    try {
+      const key = `${this.PRESENCE_PREFIX}${userId}`;
+      await redis.del(key);
+    } catch (err) {
+      logger.error({ err, userId }, 'Failed to remove user presence from Redis');
+    }
+  }
+
+  /**
+   * Refresh user TTL (called periodically to keep user online)
+   */
+  static async refreshPresence(userId: string): Promise<void> {
+    try {
+      const key = `${this.PRESENCE_PREFIX}${userId}`;
+      await redis.expire(key, this.PRESENCE_TTL);
+    } catch (err) {
+      logger.error({ err, userId }, 'Failed to refresh user presence TTL');
+    }
+  }
+
+  /**
+   * Get all online users (for admin/monitoring purposes)
+   */
+  static async getAllOnline(): Promise<SocketUser[]> {
+    try {
+      const keys = await redis.keys(`${this.PRESENCE_PREFIX}*`);
+      if (keys.length === 0) return [];
+
+      const values = await redis.mget(...keys);
+      return values
+        .filter((v): v is string => v !== null)
+        .map((v) => JSON.parse(v))
+        .filter((u): u is SocketUser => u !== null);
+    } catch (err) {
+      logger.error({ err }, 'Failed to get all online users from Redis');
+      return [];
+    }
+  }
+}
 
 export function createSocketHub(httpServer: HttpServer): SocketIOServer {
   const io = new SocketIOServer(httpServer, {
@@ -76,9 +152,16 @@ export function createSocketHub(httpServer: HttpServer): SocketIOServer {
   // ── Connection handler ────────────────────────────────────────────────────
   io.on('connection', (socket) => {
     const socketUser = (socket as Socket & { quantneonUser?: SocketUser }).quantneonUser!;
-    onlineUsers.set(socketUser.userId, { ...socketUser, socketId: socket.id });
+
+    // Set user presence in Redis
+    PresenceRegistry.setOnline({ ...socketUser, socketId: socket.id });
 
     logger.info({ userId: socketUser.userId }, '[Socket] User connected');
+
+    // Periodic presence refresh (every 15s to keep TTL alive)
+    const presenceInterval = setInterval(() => {
+      PresenceRegistry.refreshPresence(socketUser.userId);
+    }, 15_000);
 
     // Broadcast presence
     socket.broadcast.emit('user:online', {
@@ -125,12 +208,18 @@ export function createSocketHub(httpServer: HttpServer): SocketIOServer {
     // ── Live stream events ───────────────────────────────────────────────
     socket.on('stream:join', async (data: { streamId: string }) => {
       socket.join(`stream:${data.streamId}`);
-      await prisma.liveStream
-        .update({
+
+      try {
+        await prisma.liveStream.update({
           where: { id: data.streamId },
           data: { viewerCount: { increment: 1 } },
-        })
-        .catch(() => {});
+        });
+      } catch (err) {
+        logger.warn(
+          { err, streamId: data.streamId, userId: socketUser.userId },
+          'Failed to increment stream viewer count - stream may not exist'
+        );
+      }
 
       io.to(`stream:${data.streamId}`).emit('stream:viewer_joined', {
         userId: socketUser.userId,
@@ -140,12 +229,18 @@ export function createSocketHub(httpServer: HttpServer): SocketIOServer {
 
     socket.on('stream:leave', async (data: { streamId: string }) => {
       socket.leave(`stream:${data.streamId}`);
-      await prisma.liveStream
-        .update({
+
+      try {
+        await prisma.liveStream.update({
           where: { id: data.streamId },
           data: { viewerCount: { decrement: 1 } },
-        })
-        .catch(() => {});
+        });
+      } catch (err) {
+        logger.warn(
+          { err, streamId: data.streamId, userId: socketUser.userId },
+          'Failed to decrement stream viewer count - stream may not exist'
+        );
+      }
     });
 
     socket.on('stream:reaction', (data: { streamId: string; emoji: string }) => {
@@ -165,7 +260,11 @@ export function createSocketHub(httpServer: HttpServer): SocketIOServer {
 
     // ── Disconnect ───────────────────────────────────────────────────────
     socket.on('disconnect', () => {
-      onlineUsers.delete(socketUser.userId);
+      // Clear presence refresh interval
+      clearInterval(presenceInterval);
+
+      // Remove user from Redis presence
+      PresenceRegistry.setOffline(socketUser.userId);
 
       // Notify room members if user was in a lobby
       if (socketUser.room) {
@@ -183,4 +282,4 @@ export function createSocketHub(httpServer: HttpServer): SocketIOServer {
   return io;
 }
 
-export { onlineUsers };
+export { PresenceRegistry };
